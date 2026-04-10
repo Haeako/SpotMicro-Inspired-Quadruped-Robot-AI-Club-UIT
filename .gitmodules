@@ -1,0 +1,3 @@
+[submodule "src/catkin_ws/src/ros-i2cpwmboard"]
+	path = src/catkin_ws/src/ros-i2cpwmboard
+	url = https://gitlab.com/aissitech/ros-i2cpwmboard.git

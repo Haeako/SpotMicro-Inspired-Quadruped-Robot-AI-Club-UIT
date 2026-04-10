@@ -13,7 +13,7 @@ find_package(catkin REQUIRED COMPONENTS
   hector_map_server
   hector_mapping
   hector_trajectory_server
-  rviz
+#  rviz
   tf
   tf2
   topic_tools

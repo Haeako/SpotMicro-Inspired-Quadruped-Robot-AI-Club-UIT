@@ -1,2 +1,5 @@
 src/catkin_ws/src/assets/3_right_link_angles_example.png
 src/catkin_ws/src/assets/spot_micro_walking.gif
+src/catkin_ws/build
+src/catkin_ws/devel
+src/catkin_ws/log.log

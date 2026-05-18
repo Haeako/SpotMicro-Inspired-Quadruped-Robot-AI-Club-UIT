@@ -1,31 +1,42 @@
 cmake_minimum_required(VERSION 3.0.2)
-project(spot_micro_launch)
+project(spot_keyword_spotting)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 ## Find catkin macros and libraries
 ## if COMPONENTS list like find_package(catkin REQUIRED COMPONENTS xyz)
 ## is used, also find other catkin packages
 find_package(catkin REQUIRED COMPONENTS
-  hector_geotiff
-  hector_geotiff_plugins
-  hector_map_server
-  hector_mapping
-  hector_trajectory_server
-  tf
-  tf2
-  topic_tools
+  roscpp
+  std_msgs
+  
+)
+find_package(Python3 REQUIRED COMPONENTS
+    Interpreter
+    Development
 )
 
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
-
+find_package(pybind11 REQUIRED)
 
 ## Uncomment this if the package has a setup.py. This macro ensures
 ## modules and global scripts declared therein get installed
 ## See http://ros.org/doc/api/catkin/html/user_guide/setup_dot_py.html
 # catkin_python_setup()
+catkin_package()
+
+execute_process(
+    COMMAND python3 -c
+    "import numpy; print(numpy.get_include())"
+
+    OUTPUT_VARIABLE NUMPY_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
 
 ################################################
 ## Declare ROS messages, services and actions ##
@@ -75,7 +86,7 @@ find_package(catkin REQUIRED COMPONENTS
 ## Generate added messages and services with any dependencies listed here
 # generate_messages(
 #   DEPENDENCIES
-#   std_msgs  # Or other packages containing msgs
+#   std_msgs
 # )
 
 ################################################
@@ -109,8 +120,8 @@ find_package(catkin REQUIRED COMPONENTS
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
 #  INCLUDE_DIRS include
-#  LIBRARIES spot_micro_launch
-#  CATKIN_DEPENDS hector_geotiff hector_geotiff_plugins hector_map_server hector_mapping hector_trajectory_server rviz tf tf2 topic_tools
+#  LIBRARIES spot_keyword_spotting
+#  CATKIN_DEPENDS roscpp std_msgs 
 #  DEPENDS system_lib
 )
 
@@ -123,11 +134,12 @@ catkin_package(
 include_directories(
 # include
   ${catkin_INCLUDE_DIRS}
+  ${Python3_INCLUDE_DIRS}
 )
 
 ## Declare a C++ library
 # add_library(${PROJECT_NAME}
-#   src/${PROJECT_NAME}/spot_micro_launch.cpp
+#   src/${PROJECT_NAME}/spot_keyword_spotting.cpp
 # )
 
 ## Add cmake target dependencies of the library
@@ -138,7 +150,7 @@ include_directories(
 ## Declare a C++ executable
 ## With catkin_make all packages are built within a single CMake context
 ## The recommended prefix ensures that target names across packages don't collide
-# add_executable(${PROJECT_NAME}_node src/spot_micro_launch_node.cpp)
+# add_executable(${PROJECT_NAME}_node src/spot_keyword_spotting_node.cpp)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -154,6 +166,30 @@ include_directories(
 # target_link_libraries(${PROJECT_NAME}_node
 #   ${catkin_LIBRARIES}
 # )
+
+# Add native compilation for the `ringbuffer.cpp` file
+add_library(ringbuffer STATIC
+  keyword_spotting/native/src/ringbuffer.cpp
+)
+
+# Link the library with necessary dependencies
+target_link_libraries(ringbuffer
+  ${catkin_LIBRARIES}
+)
+
+# Find Python and pybind11
+find_package(Python3 COMPONENTS Interpreter Development)
+find_package(pybind11 REQUIRED)
+
+# Add Python module target
+pybind11_add_module(ringbuffer_py
+  keyword_spotting/native/src/ringbuffer.cpp
+)
+
+# Link libraries
+target_link_libraries(ringbuffer_py
+  PRIVATE ${catkin_LIBRARIES}
+)
 
 #############
 ## Install ##
@@ -202,10 +238,11 @@ include_directories(
 #############
 
 ## Add gtest based cpp test target and link libraries
-# catkin_add_gtest(${PROJECT_NAME}-test test/test_spot_micro_launch.cpp)
+# catkin_add_gtest(${PROJECT_NAME}-test test/test_spot_keyword_spotting.cpp)
 # if(TARGET ${PROJECT_NAME}-test)
 #   target_link_libraries(${PROJECT_NAME}-test ${PROJECT_NAME})
 # endif()
 
 ## Add folders to be run by python nosetests
 # catkin_add_nosetests(test)
+

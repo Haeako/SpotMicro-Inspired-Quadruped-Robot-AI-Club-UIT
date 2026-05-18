@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inference wrapper for the keyword spotting model."""
+"""Inference wrapper for the TensorFlow Lite keyword spotting model."""
 
 from __future__ import annotations
 
@@ -20,6 +20,20 @@ SAMPLE_RATE = int(kws_native.SAMPLE_RATE)
 EXPECTED_SAMPLES = int(kws_native.EXPECTED_SAMPLES)
 HOP_LENGTH = int(kws_native.HOP_LENGTH)
 DEFAULT_LABELS = ("background", "marvin")
+
+
+def _load_tflite_interpreter():
+    try:
+        from tflite_runtime.interpreter import Interpreter
+        return Interpreter
+    except ImportError:
+        try:
+            from tensorflow.lite.python.interpreter import Interpreter
+            return Interpreter
+        except ImportError as exc:
+            raise RuntimeError(
+                "TensorFlow Lite inference requires either `tflite_runtime` or `tensorflow`."
+            ) from exc
 
 
 def _pcm_to_float32(raw: bytes, sample_width: int) -> np.ndarray:
@@ -100,22 +114,52 @@ class KeywordSpotter:
         labels: Iterable[str] = DEFAULT_LABELS,
         threshold: float = 0.5,
     ) -> None:
-        try:
-            import onnxruntime as ort
-        except ImportError as exc:
-            raise RuntimeError("onnxruntime is required for keyword inference") from exc
-
         self.model_path = Path(model_path)
         self.labels = tuple(labels)
         self.threshold = float(threshold)
-        self.session = ort.InferenceSession(str(self.model_path), providers=["CPUExecutionProvider"])
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
+
+        Interpreter = _load_tflite_interpreter()
+        self.interpreter = Interpreter(model_path=str(self.model_path))
+        self.interpreter.allocate_tensors()
+        self.input_details = self.interpreter.get_input_details()
+        self.output_details = self.interpreter.get_output_details()
+        self.input_index = self.input_details[0]["index"]
+        self.output_index = self.output_details[0]["index"]
+        self.input_dtype = self.input_details[0]["dtype"]
+
+    def _prepare_input(self, spectrogram: np.ndarray) -> np.ndarray:
+        model_input = to_model_input(spectrogram)
+        if self.input_dtype == np.float32:
+            return model_input.astype(np.float32, copy=False)
+
+        quant = self.input_details[0].get("quantization", (0.0, 0))
+        scale, zero_point = quant
+        if scale and scale > 0:
+            model_input = np.round(model_input / scale + zero_point)
+        return model_input.astype(self.input_dtype)
+
+    def _read_score(self) -> float:
+        output = self.interpreter.get_tensor(self.output_index)
+        output = np.asarray(output)
+
+        if output.dtype != np.float32:
+            quant = self.output_details[0].get("quantization", (0.0, 0))
+            scale, zero_point = quant
+            if scale and scale > 0:
+                output = (output.astype(np.float32) - zero_point) * scale
+
+        scores = output.reshape(-1).astype(np.float32)
+        if scores.size == 1:
+            return float(scores[0])
+        if scores.size >= 2:
+            return float(scores[1])
+        raise RuntimeError("TFLite model returned an empty output tensor")
 
     def predict_spectrogram(self, spectrogram: np.ndarray) -> dict[str, float | str]:
-        model_input = to_model_input(spectrogram)
-        output = self.session.run([self.output_name], {self.input_name: model_input})[0]
-        score = float(np.asarray(output).reshape(-1)[0])
+        model_input = self._prepare_input(spectrogram)
+        self.interpreter.set_tensor(self.input_index, model_input)
+        self.interpreter.invoke()
+        score = self._read_score()
         label = self.labels[1] if score >= self.threshold else self.labels[0]
         return {"label": label, "score": score}
 
@@ -144,7 +188,7 @@ class KeywordSpotter:
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Run keyword inference on a 16 kHz WAV file.")
+    parser = argparse.ArgumentParser(description="Run TFLite keyword inference on a 16 kHz WAV file.")
     parser.add_argument("wav_path")
     parser.add_argument("--model", required=True)
     parser.add_argument("--threshold", type=float, default=0.5)

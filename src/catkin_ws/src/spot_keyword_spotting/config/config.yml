@@ -1,5 +1,5 @@
 model:
-  path: "keyword_spotting/weights/checkpoint.onnx"
+  path: "keyword_spotting/weights/checkpoint.tflite"
   confidence: 0.95
   labels: ["background", "marvin"]
 ros:

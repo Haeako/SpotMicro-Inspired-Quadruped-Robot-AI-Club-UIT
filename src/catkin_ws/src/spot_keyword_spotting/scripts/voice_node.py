@@ -23,7 +23,7 @@ from model import KeywordSpotter  # noqa: E402
 class VoiceNode:
     def __init__(self) -> None:
         package_root = Path(rospkg.RosPack().get_path("spot_keyword_spotting"))
-        default_model = package_root / "keyword_spotting" / "weights" / "checkpoint.onnx"
+        default_model = package_root / "keyword_spotting" / "weights" / "checkpoint.tflite"
 
         model_path = Path(rospy.get_param("~model_path", str(default_model)))
         threshold = float(rospy.get_param("~confidence", rospy.get_param("~threshold", 0.95)))
@@ -53,4 +53,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

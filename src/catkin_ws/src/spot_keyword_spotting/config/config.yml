@@ -1,4 +1,7 @@
-model: [
-  path: "..",
-  conf: 0.95
-]
+model:
+  path: "keyword_spotting/weights/checkpoint.onnx"
+  confidence: 0.95
+  labels: ["background", "marvin"]
+ros:
+  publish_topic: "~command"
+  audio_topic: "~audio"

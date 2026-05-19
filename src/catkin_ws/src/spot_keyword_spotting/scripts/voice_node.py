@@ -77,7 +77,7 @@ class StreamingSpectrogram:
     def __init__(
         self,
         window_samples: int = EXPECTED_SAMPLES,
-        emit_hop_samples: int = HOP_LENGTH,
+        emit_hop_samples: int = EXPECTED_SAMPLES // 2,
     ) -> None:
         self.emit_hop_samples = int(emit_hop_samples)
         self.ring = kws_native.RingBuffer(int(window_samples))
@@ -225,6 +225,14 @@ class VoiceNode:
             _get_private_param("num_threads", 2)
         )
 
+        infer_hop_samples = int(
+            _get_private_param(("infer_hop_samples", "model/infer_hop_samples"), EXPECTED_SAMPLES // 2)
+        )
+
+        fallback_audio_channels = int(
+            _get_private_param(("audio_channels", "ros/audio_channels"), 1)
+        )
+
         audio_topic = _get_private_param(
             ("audio_topic", "ros/audio_topic"),
             "/audio/raw"
@@ -251,7 +259,10 @@ class VoiceNode:
             num_threads=num_threads,
         )
 
-        self.streamer = StreamingSpectrogram()
+        self.streamer = StreamingSpectrogram(
+            emit_hop_samples=infer_hop_samples,
+        )
+        self.fallback_audio_channels = max(1, fallback_audio_channels)
         self._audio_messages = 0
         self._audio_bytes = 0
         self._inference_count = 0
@@ -286,11 +297,18 @@ class VoiceNode:
             rospy.loginfo("Publishing inference topic: %s", inference_topic)
         rospy.loginfo("Model path: %s", model_path)
         rospy.loginfo(
-            "Threshold: %.3f, expected samples: %d, hop length: %d",
+            "Threshold: %.3f, expected samples: %d, inference hop samples: %d",
             self.spotter.threshold,
             EXPECTED_SAMPLES,
-            HOP_LENGTH,
+            self.streamer.emit_hop_samples,
         )
+
+    def _layout_dim_size(self, msg: UInt8MultiArray, label: str) -> int | None:
+        for dim in msg.layout.dim:
+            if dim.label == label:
+                return int(dim.size)
+
+        return None
 
     def on_audio(self, msg: UInt8MultiArray) -> None:
         raw = np.frombuffer(
@@ -325,6 +343,29 @@ class VoiceNode:
             raw = raw[:-1]
 
         audio = raw.view(np.int16).astype(np.float32)
+
+        channels = self._layout_dim_size(msg, "channels")
+
+        if channels is None or channels <= 0:
+            channels = self.fallback_audio_channels
+
+        if channels > 1:
+            if audio.size % channels != 0:
+                rospy.logwarn_throttle(
+                    5.0,
+                    "Audio sample count %d is not divisible by channel count %d; trimming packet",
+                    audio.size,
+                    channels,
+                )
+                audio = audio[: audio.size - (audio.size % channels)]
+
+            audio = audio.reshape(-1, channels).mean(axis=1)
+            rospy.loginfo_throttle(
+                5.0,
+                "Downmixed %d-channel audio to mono for inference",
+                channels,
+            )
+
         audio /= 32768.0
 
         for spectrogram in self.streamer.push(audio):

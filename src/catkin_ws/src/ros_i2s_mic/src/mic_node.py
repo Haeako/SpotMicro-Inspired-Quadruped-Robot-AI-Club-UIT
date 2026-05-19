@@ -3,7 +3,10 @@
 import rospy
 import alsaaudio
 
-from std_msgs.msg import UInt8MultiArray
+from std_msgs.msg import MultiArrayDimension, UInt8MultiArray
+
+
+BYTES_PER_SAMPLE = 2
 
 class I2SMicNode:
     def __init__(self):
@@ -15,6 +18,7 @@ class I2SMicNode:
         self.audio_topic = rospy.get_param("~audio_topic", "/audio/raw")
         self._published_messages = 0
         self._published_bytes = 0
+        self._last_channels = self.channels
 
         self.publisher = rospy.Publisher(
             self.audio_topic,
@@ -59,8 +63,27 @@ class I2SMicNode:
             length, data = self.mic.read()
 
             if length > 0:
+                actual_channels = self.channels
+
+                if len(data) % (length * BYTES_PER_SAMPLE) == 0:
+                    actual_channels = len(data) // (length * BYTES_PER_SAMPLE)
+
+                if actual_channels != self.channels:
+                    rospy.logwarn_throttle(
+                        5.0,
+                        "ALSA returned %d channel(s), configured channel count is %d",
+                        actual_channels,
+                        self.channels,
+                    )
+
+                self._last_channels = actual_channels
 
                 msg = UInt8MultiArray()
+                msg.layout.dim = [
+                    MultiArrayDimension("frames", length, len(data)),
+                    MultiArrayDimension("channels", actual_channels, actual_channels * BYTES_PER_SAMPLE),
+                    MultiArrayDimension("sample_width_bytes", BYTES_PER_SAMPLE, BYTES_PER_SAMPLE),
+                ]
                 msg.data = bytearray(data)
 
                 self.publisher.publish(msg)
@@ -68,10 +91,11 @@ class I2SMicNode:
                 self._published_bytes += len(data)
                 rospy.loginfo_throttle(
                     5.0,
-                    "Audio output alive: messages=%d, total_bytes=%d, latest_frames=%d, latest_bytes=%d",
+                    "Audio output alive: messages=%d, total_bytes=%d, latest_frames=%d, latest_channels=%d, latest_bytes=%d",
                     self._published_messages,
                     self._published_bytes,
                     length,
+                    actual_channels,
                     len(data),
                 )
             else:

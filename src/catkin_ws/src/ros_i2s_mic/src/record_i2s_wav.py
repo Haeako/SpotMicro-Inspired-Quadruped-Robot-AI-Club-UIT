@@ -26,6 +26,11 @@ def parse_args():
     parser.add_argument("--duration", type=float, default=5.0)
     parser.add_argument("--gain", type=float, default=1.0)
     parser.add_argument("--output", default="i2s_mic_test.wav")
+    parser.add_argument(
+        "--dump-stats",
+        action="store_true",
+        help="Print raw per-channel stats before writing the WAV file.",
+    )
     return parser.parse_args()
 
 
@@ -86,10 +91,33 @@ def main():
             channel = int(np.argmax(rms))
 
         mono = samples[:, channel] / scale
+        if args.dump_stats and not chunks:
+            rms = np.sqrt(np.mean(samples * samples, axis=0))
+            peak = np.max(np.abs(samples), axis=0)
+            print(
+                "First block: length={}, bytes={}, values={}, per_channel_peak={}, per_channel_rms={}".format(
+                    length,
+                    len(data),
+                    samples.size,
+                    np.array2string(peak, precision=1, separator=","),
+                    np.array2string(rms, precision=1, separator=","),
+                )
+            )
         chunks.append(mono)
         frames_read += length
 
     audio = np.concatenate(chunks)[:target_frames]
+    if args.dump_stats and audio.size:
+        print(
+            "Selected channel preview: float_min={:.9f}, float_max={:.9f}, raw_min={:.0f}, raw_max={:.0f}, first10_raw={}".format(
+                float(np.min(audio)),
+                float(np.max(audio)),
+                float(np.min(audio * scale)),
+                float(np.max(audio * scale)),
+                np.array2string((audio[:10] * scale).astype(np.int64), separator=","),
+            )
+        )
+
     audio = np.clip(audio * args.gain, -1.0, 1.0)
     wav_pcm = (audio * 32767.0).astype("<i2")
 

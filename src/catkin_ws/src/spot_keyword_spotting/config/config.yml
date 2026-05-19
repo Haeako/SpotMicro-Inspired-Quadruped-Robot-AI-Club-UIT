@@ -9,3 +9,5 @@ ros:
   publish_inference: true
   audio_topic: "/audio/raw"
   audio_channels: 1
+  sample_width_bytes: 4
+  audio_channel_index: -1

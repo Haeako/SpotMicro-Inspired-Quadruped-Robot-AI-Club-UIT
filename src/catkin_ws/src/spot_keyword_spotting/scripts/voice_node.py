@@ -233,6 +233,14 @@ class VoiceNode:
             _get_private_param(("audio_channels", "ros/audio_channels"), 1)
         )
 
+        fallback_sample_width_bytes = int(
+            _get_private_param(("sample_width_bytes", "ros/sample_width_bytes"), 4)
+        )
+
+        audio_channel_index = int(
+            _get_private_param(("audio_channel_index", "ros/audio_channel_index"), -1)
+        )
+
         audio_topic = _get_private_param(
             ("audio_topic", "ros/audio_topic"),
             "/audio/raw"
@@ -263,6 +271,8 @@ class VoiceNode:
             emit_hop_samples=infer_hop_samples,
         )
         self.fallback_audio_channels = max(1, fallback_audio_channels)
+        self.fallback_sample_width_bytes = fallback_sample_width_bytes
+        self.audio_channel_index = audio_channel_index
         self._audio_messages = 0
         self._audio_bytes = 0
         self._inference_count = 0
@@ -334,15 +344,35 @@ class VoiceNode:
             )
             return
 
-        if raw.size % 2 != 0:
+        sample_width_bytes = self._layout_dim_size(msg, "sample_width_bytes")
+
+        if sample_width_bytes is None:
+            sample_width_bytes = self.fallback_sample_width_bytes
+
+        if sample_width_bytes == 4:
+            dtype = np.dtype("<i4")
+            scale = 2147483648.0
+        elif sample_width_bytes == 2:
+            dtype = np.dtype("<i2")
+            scale = 32768.0
+        else:
             rospy.logwarn_throttle(
                 5.0,
-                "Audio packet has odd byte count (%d); dropping the last byte",
-                raw.size,
+                "Unsupported audio sample width: %d byte(s)",
+                sample_width_bytes,
             )
-            raw = raw[:-1]
+            return
 
-        audio = raw.view(np.int16).astype(np.float32)
+        if raw.size % sample_width_bytes != 0:
+            rospy.logwarn_throttle(
+                5.0,
+                "Audio packet byte count %d is not divisible by sample width %d; trimming packet",
+                raw.size,
+                sample_width_bytes,
+            )
+            raw = raw[: raw.size - (raw.size % sample_width_bytes)]
+
+        audio = raw.view(dtype).astype(np.float32)
 
         channels = self._layout_dim_size(msg, "channels")
 
@@ -359,14 +389,37 @@ class VoiceNode:
                 )
                 audio = audio[: audio.size - (audio.size % channels)]
 
-            audio = audio.reshape(-1, channels).mean(axis=1)
+            audio_by_channel = audio.reshape(-1, channels)
+            channel_rms = np.sqrt(np.mean(audio_by_channel * audio_by_channel, axis=0))
+
+            if 0 <= self.audio_channel_index < channels:
+                selected_channel = self.audio_channel_index
+            else:
+                selected_channel = int(np.argmax(channel_rms))
+
+            audio = audio_by_channel[:, selected_channel]
             rospy.loginfo_throttle(
                 5.0,
-                "Downmixed %d-channel audio to mono for inference",
+                "Selected channel %d/%d for inference, channel_rms=%s",
+                selected_channel,
                 channels,
+                np.array2string(channel_rms, precision=2, separator=","),
             )
 
-        audio /= 32768.0
+        audio /= scale
+
+        if audio.size:
+            peak = float(np.max(np.abs(audio)))
+            rms = float(np.sqrt(np.mean(audio * audio)))
+            rospy.loginfo_throttle(
+                5.0,
+                "Audio stats: samples=%d, channels=%d, sample_width=%d, peak=%.6f, rms=%.6f",
+                audio.size,
+                channels,
+                sample_width_bytes,
+                peak,
+                rms,
+            )
 
         for spectrogram in self.streamer.push(audio):
             result = self.spotter.predict_spectrogram(spectrogram)

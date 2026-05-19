@@ -6,7 +6,11 @@ import alsaaudio
 from std_msgs.msg import MultiArrayDimension, UInt8MultiArray
 
 
-BYTES_PER_SAMPLE = 2
+SAMPLE_FORMATS = {
+    "S16_LE": (alsaaudio.PCM_FORMAT_S16_LE, 2),
+    "S32_LE": (alsaaudio.PCM_FORMAT_S32_LE, 4),
+}
+
 
 class I2SMicNode:
     def __init__(self):
@@ -16,6 +20,18 @@ class I2SMicNode:
         self.channels = int(rospy.get_param("~channels", 1))
         self.period_size = int(rospy.get_param("~period_size", 512))
         self.audio_topic = rospy.get_param("~audio_topic", "/audio/raw")
+        self.sample_format = rospy.get_param("~sample_format", "S32_LE").upper()
+
+        if self.sample_format not in SAMPLE_FORMATS:
+            supported = ", ".join(sorted(SAMPLE_FORMATS))
+            raise ValueError(
+                "Unsupported sample_format '{}'. Supported values: {}".format(
+                    self.sample_format,
+                    supported,
+                )
+            )
+
+        self.alsa_format, self.bytes_per_sample = SAMPLE_FORMATS[self.sample_format]
         self._published_messages = 0
         self._published_bytes = 0
         self._last_channels = self.channels
@@ -35,7 +51,7 @@ class I2SMicNode:
 
             self.mic.setchannels(self.channels)
             self.mic.setrate(self.sample_rate)
-            self.mic.setformat(alsaaudio.PCM_FORMAT_S16_LE)
+            self.mic.setformat(self.alsa_format)
             self.mic.setperiodsize(self.period_size)
         except alsaaudio.ALSAAudioError as exc:
             rospy.logfatal(
@@ -46,11 +62,12 @@ class I2SMicNode:
             raise
 
         rospy.loginfo(
-            "I2S mic started: device=%s, topic=%s, sample_rate=%d, channels=%d, period_size=%d",
+            "I2S mic started: device=%s, topic=%s, sample_rate=%d, channels=%d, sample_format=%s, period_size=%d",
             self.device,
             self.audio_topic,
             self.sample_rate,
             self.channels,
+            self.sample_format,
             self.period_size,
         )
 
@@ -65,8 +82,8 @@ class I2SMicNode:
             if length > 0:
                 actual_channels = self.channels
 
-                if len(data) % (length * BYTES_PER_SAMPLE) == 0:
-                    actual_channels = len(data) // (length * BYTES_PER_SAMPLE)
+                if len(data) % (length * self.bytes_per_sample) == 0:
+                    actual_channels = len(data) // (length * self.bytes_per_sample)
 
                 if actual_channels != self.channels:
                     rospy.logwarn_throttle(
@@ -81,8 +98,8 @@ class I2SMicNode:
                 msg = UInt8MultiArray()
                 msg.layout.dim = [
                     MultiArrayDimension("frames", length, len(data)),
-                    MultiArrayDimension("channels", actual_channels, actual_channels * BYTES_PER_SAMPLE),
-                    MultiArrayDimension("sample_width_bytes", BYTES_PER_SAMPLE, BYTES_PER_SAMPLE),
+                    MultiArrayDimension("channels", actual_channels, actual_channels * self.bytes_per_sample),
+                    MultiArrayDimension("sample_width_bytes", self.bytes_per_sample, self.bytes_per_sample),
                 ]
                 msg.data = bytearray(data)
 

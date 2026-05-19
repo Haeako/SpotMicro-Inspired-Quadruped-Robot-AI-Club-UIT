@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import errno
+
 import rospy
 import alsaaudio
 
@@ -73,8 +75,6 @@ class I2SMicNode:
 
     def run(self):
 
-        rate = rospy.Rate(100)
-
         while not rospy.is_shutdown():
 
             length, data = self.mic.read()
@@ -117,14 +117,29 @@ class I2SMicNode:
                     len(data),
                 )
             else:
+                if length == -errno.EPIPE:
+                    rospy.logwarn_throttle(
+                        5.0,
+                        "ALSA overrun on device %s (length=%d); recovering capture stream",
+                        self.device,
+                        length,
+                    )
+                    try:
+                        self.mic.prepare()
+                    except alsaaudio.ALSAAudioError as exc:
+                        rospy.logwarn_throttle(
+                            5.0,
+                            "Failed to recover ALSA capture stream: %s",
+                            exc,
+                        )
+                    continue
+
                 rospy.logwarn_throttle(
                     5.0,
                     "No audio frames read from device %s (length=%d)",
                     self.device,
                     length,
                 )
-
-            rate.sleep()
 
 
 def main():

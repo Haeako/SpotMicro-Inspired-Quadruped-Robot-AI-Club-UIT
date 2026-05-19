@@ -16,9 +16,9 @@ class I2SMicNode:
     def __init__(self):
 
         self.device = rospy.get_param("~device", "hw:1,0")
-        self.sample_rate = int(rospy.get_param("~sample_rate", 16000))
-        self.channels = int(rospy.get_param("~channels", 1))
-        self.period_size = int(rospy.get_param("~period_size", 512))
+        self.sample_rate = int(rospy.get_param("~sample_rate", 48000))
+        self.channels = int(rospy.get_param("~channels", 2))
+        self.period_size = int(rospy.get_param("~period_size", 256))
         self.audio_topic = rospy.get_param("~audio_topic", "/audio/raw")
         self.sample_format = rospy.get_param("~sample_format", "S32_LE").upper()
 
@@ -100,6 +100,7 @@ class I2SMicNode:
                     MultiArrayDimension("frames", length, len(data)),
                     MultiArrayDimension("channels", actual_channels, actual_channels * self.bytes_per_sample),
                     MultiArrayDimension("sample_width_bytes", self.bytes_per_sample, self.bytes_per_sample),
+                    MultiArrayDimension("sample_rate", self.sample_rate, self.sample_rate),
                 ]
                 msg.data = bytearray(data)
 

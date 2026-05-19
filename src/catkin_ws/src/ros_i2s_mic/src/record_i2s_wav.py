@@ -18,11 +18,11 @@ def parse_args():
         description="Record an I2S microphone to a mono 16-bit WAV file."
     )
     parser.add_argument("--device", default="hw:1,0")
-    parser.add_argument("--rate", type=int, default=16000)
+    parser.add_argument("--rate", type=int, default=48000)
     parser.add_argument("--channels", type=int, default=2)
     parser.add_argument("--sample-format", choices=sorted(SAMPLE_FORMATS), default="S32_LE")
     parser.add_argument("--channel-index", type=int, default=0)
-    parser.add_argument("--period-size", type=int, default=512)
+    parser.add_argument("--period-size", type=int, default=256)
     parser.add_argument("--duration", type=float, default=5.0)
     parser.add_argument("--gain", type=float, default=1.0)
     parser.add_argument("--output", default="i2s_mic_test.wav")

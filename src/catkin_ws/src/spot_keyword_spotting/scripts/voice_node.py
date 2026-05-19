@@ -237,6 +237,10 @@ class VoiceNode:
             _get_private_param(("sample_width_bytes", "ros/sample_width_bytes"), 4)
         )
 
+        fallback_input_sample_rate = int(
+            _get_private_param(("input_sample_rate", "ros/input_sample_rate"), SAMPLE_RATE)
+        )
+
         audio_channel_index = int(
             _get_private_param(("audio_channel_index", "ros/audio_channel_index"), -1)
         )
@@ -272,6 +276,7 @@ class VoiceNode:
         )
         self.fallback_audio_channels = max(1, fallback_audio_channels)
         self.fallback_sample_width_bytes = fallback_sample_width_bytes
+        self.fallback_input_sample_rate = fallback_input_sample_rate
         self.audio_channel_index = audio_channel_index
         self._audio_messages = 0
         self._audio_bytes = 0
@@ -319,6 +324,42 @@ class VoiceNode:
                 return int(dim.size)
 
         return None
+
+    def _resample_to_model_rate(self, audio: np.ndarray, input_sample_rate: int) -> np.ndarray:
+        if input_sample_rate == SAMPLE_RATE:
+            return audio
+
+        if input_sample_rate <= 0:
+            rospy.logwarn_throttle(
+                5.0,
+                "Invalid input sample rate %d; assuming model rate %d",
+                input_sample_rate,
+                SAMPLE_RATE,
+            )
+            return audio
+
+        if input_sample_rate % SAMPLE_RATE == 0:
+            factor = input_sample_rate // SAMPLE_RATE
+            rospy.loginfo_throttle(
+                5.0,
+                "Downsampled audio from %d Hz to %d Hz by factor %d",
+                input_sample_rate,
+                SAMPLE_RATE,
+                factor,
+            )
+            return audio[::factor]
+
+        duration = audio.size / float(input_sample_rate)
+        output_size = max(1, int(round(duration * SAMPLE_RATE)))
+        source_x = np.linspace(0.0, duration, num=audio.size, endpoint=False)
+        target_x = np.linspace(0.0, duration, num=output_size, endpoint=False)
+        rospy.loginfo_throttle(
+            5.0,
+            "Resampled audio from %d Hz to %d Hz",
+            input_sample_rate,
+            SAMPLE_RATE,
+        )
+        return np.interp(target_x, source_x, audio).astype(np.float32)
 
     def on_audio(self, msg: UInt8MultiArray) -> None:
         raw = np.frombuffer(
@@ -420,6 +461,13 @@ class VoiceNode:
                 peak,
                 rms,
             )
+
+        input_sample_rate = self._layout_dim_size(msg, "sample_rate")
+
+        if input_sample_rate is None:
+            input_sample_rate = self.fallback_input_sample_rate
+
+        audio = self._resample_to_model_rate(audio, input_sample_rate)
 
         for spectrogram in self.streamer.push(audio):
             result = self.spotter.predict_spectrogram(spectrogram)

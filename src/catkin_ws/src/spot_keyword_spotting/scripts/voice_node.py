@@ -27,6 +27,28 @@ HOP_LENGTH = int(kws_native.HOP_LENGTH)
 DEFAULT_LABELS = ("background", "marvin")
 
 
+def _get_private_param(names: str | Iterable[str], default):
+    if isinstance(names, str):
+        names = (names,)
+
+    for name in names:
+        private_name = name if name.startswith("~") else "~" + name
+
+        if rospy.has_param(private_name):
+            return rospy.get_param(private_name)
+
+    return default
+
+
+def _resolve_package_path(package_root: Path, value: str | Path) -> Path:
+    path = Path(value)
+
+    if path.is_absolute():
+        return path
+
+    return package_root / path
+
+
 def _load_tflite_interpreter():
     try:
         from tflite_runtime.interpreter import Interpreter
@@ -185,31 +207,41 @@ class VoiceNode:
             / "checkpoint.tflite"
         )
 
-        model_path = Path(
-            rospy.get_param("~model_path", str(default_model))
+        model_path = _resolve_package_path(
+            package_root,
+            _get_private_param(("model_path", "model/path"), str(default_model)),
         )
 
         threshold = float(
-            rospy.get_param("~threshold", 0.95)
+            _get_private_param(("threshold", "model/confidence"), 0.95)
         )
 
-        labels = rospy.get_param(
-            "~labels",
+        labels = _get_private_param(
+            ("labels", "model/labels"),
             ["background", "marvin"]
         )
 
         num_threads = int(
-            rospy.get_param("~num_threads", 2)
+            _get_private_param("num_threads", 2)
         )
 
-        audio_topic = rospy.get_param(
-            "~audio_topic",
+        audio_topic = _get_private_param(
+            ("audio_topic", "ros/audio_topic"),
             "/audio/raw"
         )
 
-        command_topic = rospy.get_param(
-            "~command_topic",
+        command_topic = _get_private_param(
+            ("command_topic", "ros/publish_topic"),
             "/voice/command"
+        )
+
+        inference_topic = _get_private_param(
+            ("inference_topic", "ros/inference_topic"),
+            "/voice/inference"
+        )
+
+        publish_inference = bool(
+            _get_private_param(("publish_inference", "ros/publish_inference"), True)
         )
 
         self.spotter = KeywordSpotter(
@@ -220,12 +252,24 @@ class VoiceNode:
         )
 
         self.streamer = StreamingSpectrogram()
+        self._audio_messages = 0
+        self._audio_bytes = 0
+        self._inference_count = 0
 
         self.publisher = rospy.Publisher(
             command_topic,
             VoiceCommand,
             queue_size=10,
         )
+
+        self.inference_publisher = None
+
+        if publish_inference:
+            self.inference_publisher = rospy.Publisher(
+                inference_topic,
+                VoiceCommand,
+                queue_size=10,
+            )
 
         self.subscriber = rospy.Subscriber(
             audio_topic,
@@ -238,7 +282,15 @@ class VoiceNode:
         rospy.loginfo("Keyword spotting node started")
         rospy.loginfo("Subscribing audio topic: %s", audio_topic)
         rospy.loginfo("Publishing command topic: %s", command_topic)
+        if publish_inference:
+            rospy.loginfo("Publishing inference topic: %s", inference_topic)
         rospy.loginfo("Model path: %s", model_path)
+        rospy.loginfo(
+            "Threshold: %.3f, expected samples: %d, hop length: %d",
+            self.spotter.threshold,
+            EXPECTED_SAMPLES,
+            HOP_LENGTH,
+        )
 
     def on_audio(self, msg: UInt8MultiArray) -> None:
         raw = np.frombuffer(
@@ -246,10 +298,30 @@ class VoiceNode:
             dtype=np.uint8,
         )
 
+        self._audio_messages += 1
+        self._audio_bytes += int(raw.size)
+        rospy.loginfo_throttle(
+            5.0,
+            "Audio input alive: messages=%d, total_bytes=%d, latest_bytes=%d",
+            self._audio_messages,
+            self._audio_bytes,
+            raw.size,
+        )
+
         if raw.size < 2:
+            rospy.logwarn_throttle(
+                5.0,
+                "Ignoring too-short audio packet: %d byte(s)",
+                raw.size,
+            )
             return
 
         if raw.size % 2 != 0:
+            rospy.logwarn_throttle(
+                5.0,
+                "Audio packet has odd byte count (%d); dropping the last byte",
+                raw.size,
+            )
             raw = raw[:-1]
 
         audio = raw.view(np.int16).astype(np.float32)
@@ -259,12 +331,29 @@ class VoiceNode:
             result = self.spotter.predict_spectrogram(spectrogram)
 
             score = float(result["score"])
+            label = str(result["label"])
+            self._inference_count += 1
+
+            if self.inference_publisher is not None:
+                inference = VoiceCommand()
+                inference.command = label
+                inference.confidence = score
+                self.inference_publisher.publish(inference)
+
+            rospy.loginfo_throttle(
+                2.0,
+                "Inference alive: count=%d, label=%s, score=%.3f, threshold=%.3f",
+                self._inference_count,
+                label,
+                score,
+                self.spotter.threshold,
+            )
 
             if score < self.spotter.threshold:
                 continue
 
             command = VoiceCommand()
-            command.command = str(result["label"])
+            command.command = label
             command.confidence = score
 
             self.publisher.publish(command)

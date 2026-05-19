@@ -3,3 +3,5 @@ src/catkin_ws/src/assets/spot_micro_walking.gif
 src/catkin_ws/build
 src/catkin_ws/devel
 src/catkin_ws/log.log
+src/catkin_ws/src/spot_keyword_spotting/scripts/__pycache__/
+src/catkin_ws/src/ros_i2s_mic/src/__pycache__/

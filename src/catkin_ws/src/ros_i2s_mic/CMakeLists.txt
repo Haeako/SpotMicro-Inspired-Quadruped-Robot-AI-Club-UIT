@@ -161,6 +161,7 @@ include_directories(
 catkin_install_python(PROGRAMS
   src/mic_node.py
   src/record_i2s_wav.py
+  src/i2s_wav_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

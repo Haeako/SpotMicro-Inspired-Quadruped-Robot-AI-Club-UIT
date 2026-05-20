@@ -52,6 +52,7 @@ catkin_install_python(PROGRAMS
   scripts/infer_wav.py
   scripts/voice_node.py
   scripts/i2s_voice_node.py
+  scripts/i2s_window_node.py
   scripts/window_infer_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

@@ -6,7 +6,6 @@ from __future__ import annotations
 import threading
 import time
 import wave
-from math import gcd
 from pathlib import Path
 from typing import Iterable
 
@@ -130,39 +129,64 @@ class StreamingSpectrogram:
         return get_spectrogram(self.current_audio())
 
 
-class StreamingDecimator:
-    def __init__(
-        self,
-        input_sample_rate: int,
-        output_sample_rate: int,
-    ) -> None:
+class FixedRatioAveragingResampler:
+    def __init__(self, input_sample_rate: int, output_sample_rate: int) -> None:
         self.input_sample_rate = int(input_sample_rate)
         self.output_sample_rate = int(output_sample_rate)
-        self._phase = 0
+        self.factor = 1
+        self._pending = np.empty(0, dtype=np.float32)
+        self._input_count = 0
+        self._output_count = 0
 
         if self.input_sample_rate <= 0 or self.output_sample_rate <= 0:
             raise ValueError("Sample rates must be positive")
 
         if self.input_sample_rate % self.output_sample_rate != 0:
-            raise ValueError("StreamingDecimator requires an integer sample-rate ratio")
+            raise ValueError("FixedRatioAveragingResampler requires an integer sample-rate ratio")
 
         self.factor = self.input_sample_rate // self.output_sample_rate
+
+    def reset(self) -> None:
+        self._pending = np.empty(0, dtype=np.float32)
+        self._input_count = 0
+        self._output_count = 0
 
     def process(self, audio: np.ndarray) -> np.ndarray:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
 
         if audio.size == 0:
-            return audio
-
-        first = (-self._phase) % self.factor
-
-        if first >= audio.size:
-            self._phase = (self._phase + audio.size) % self.factor
             return np.empty(0, dtype=np.float32)
 
-        out = audio[first::self.factor]
-        self._phase = (self._phase + audio.size) % self.factor
-        return out.astype(np.float32, copy=False)
+        self._input_count += int(audio.size)
+
+        if self.factor == 1:
+            self._output_count += int(audio.size)
+            return audio.astype(np.float32, copy=False)
+
+        if self._pending.size:
+            audio = np.concatenate((self._pending, audio))
+
+        usable = audio.size - (audio.size % self.factor)
+        self._pending = audio[usable:].copy()
+
+        if usable <= 0:
+            return np.empty(0, dtype=np.float32)
+
+        out = audio[:usable].reshape(-1, self.factor).mean(axis=1).astype(np.float32)
+        self._output_count += int(out.size)
+        return out
+
+    @property
+    def pending_samples(self) -> int:
+        return int(self._pending.size)
+
+    @property
+    def input_count(self) -> int:
+        return int(self._input_count)
+
+    @property
+    def output_count(self) -> int:
+        return int(self._output_count)
 
 
 class KeywordSpotter:
@@ -380,8 +404,7 @@ class VoiceNode:
         self.audio_channel_index = audio_channel_index
         self.audio_gain = audio_gain
         self.inference_rate = inference_rate
-        self._decimators = {}
-        self._resample_tails = {}
+        self._resampler = FixedRatioAveragingResampler(48000, SAMPLE_RATE)
         self._lock = threading.Lock()
         self._audio_messages = 0
         self._audio_bytes = 0
@@ -609,40 +632,30 @@ class VoiceNode:
         input_sample_rate = int(input_sample_rate)
 
         if audio.size == 0:
-            return audio
+            return np.empty(0, dtype=np.float32)
 
         if input_sample_rate == SAMPLE_RATE:
-            return audio
+            return audio.astype(np.float32, copy=False)
 
-        if input_sample_rate == 48000 and SAMPLE_RATE == 16000:
-            key = "48k_to_16k_average3"
-            tail = self._resample_tails.get(key)
-            if tail is not None and tail.size:
-                audio = np.concatenate((tail, audio))
-
-            usable = audio.size - (audio.size % 3)
-            self._resample_tails[key] = audio[usable:].copy()
-
-            if usable <= 0:
-                return np.empty(0, dtype=np.float32)
-
-            out = audio[:usable].reshape(-1, 3).mean(axis=1).astype(np.float32)
-            rospy.loginfo_throttle(
-                5.0,
-                "Downsampled exact 48k->16k: in=%d usable=%d out=%d tail=%d",
-                audio.size,
-                usable,
-                out.size,
-                self._resample_tails[key].size,
+        if input_sample_rate != 48000 or SAMPLE_RATE != 16000:
+            rospy.logwarn_throttle(
+                2.0,
+                "Unsupported input_sample_rate=%d for realtime KWS; expected 48000 or 16000. Passing audio through unchanged.",
+                input_sample_rate,
             )
-            return out
+            return audio.astype(np.float32, copy=False)
 
-        rospy.logwarn_throttle(
-            2.0,
-            "Unsupported input_sample_rate=%d for realtime KWS; expected 48000 or 16000. Passing audio through unchanged.",
-            input_sample_rate,
+        out = self._resampler.process(audio)
+        rospy.loginfo_throttle(
+            5.0,
+            "Accumulator 48k->16k average3: in_total=%d out_total=%d latest_in=%d latest_out=%d pending=%d",
+            self._resampler.input_count,
+            self._resampler.output_count,
+            audio.size,
+            out.size,
+            self._resampler.pending_samples,
         )
-        return audio
+        return out
 
     def on_audio(self, msg: UInt8MultiArray) -> None:
         raw = np.frombuffer(

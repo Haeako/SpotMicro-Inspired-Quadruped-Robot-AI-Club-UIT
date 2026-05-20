@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import errno
 import importlib.util
+import queue
 import threading
 import sys
 import time
@@ -55,7 +56,7 @@ class DirectI2SVoiceNode:
         self.device = _get_private_param(("device", "i2s/device"), "hw:1,0")
         self.input_sample_rate = int(_get_private_param(("input_sample_rate", "i2s/sample_rate", "ros/input_sample_rate"), 48000))
         self.channels = int(_get_private_param(("channels", "i2s/channels", "ros/audio_channels"), 2))
-        self.period_size = int(_get_private_param(("period_size", "i2s/period_size"), 256))
+        self.period_size = int(_get_private_param(("period_size", "i2s/period_size"), 512))
         self.sample_format = str(_get_private_param(("sample_format", "i2s/sample_format"), "S32_LE")).upper()
         self.channel_index = int(_get_private_param(("channel_index", "i2s/channel_index", "ros/audio_channel_index"), 0))
         self.audio_gain = float(_get_private_param(("audio_gain", "ros/audio_gain"), 1.0))
@@ -110,6 +111,9 @@ class DirectI2SVoiceNode:
         self.best_label = "background"
         self.last_inferred_audio_seen = 0
         self.alsa_overruns = 0
+        self._chunk_write_queue = queue.Queue(maxsize=8)
+        self._chunk_writer = threading.Thread(target=self._chunk_writer_loop, daemon=True)
+        self._chunk_writer.start()
         self._lock = threading.Lock()
 
         for directory, enabled in (
@@ -206,10 +210,34 @@ class DirectI2SVoiceNode:
                 idx=getattr(self, saved_attr),
             )
             path = directory / filename
-            self._write_wav(path, chunk, sample_rate)
-            peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
-            rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
-            rospy.loginfo("Saved %s chunk: %s (peak=%.6f, rms=%.6f)", tag, path, peak, rms)
+            self._enqueue_wav_write(path, chunk, sample_rate, tag)
+
+    def _enqueue_wav_write(self, path: Path, audio: np.ndarray, sample_rate: int, tag: str) -> None:
+        try:
+            self._chunk_write_queue.put_nowait((path, audio.copy(), int(sample_rate), str(tag)))
+        except queue.Full:
+            rospy.logwarn_throttle(
+                2.0,
+                "Dropping %s WAV debug chunk because writer queue is full; disable debug recording if ALSA overruns continue.",
+                tag,
+            )
+
+    def _chunk_writer_loop(self) -> None:
+        while not rospy.is_shutdown():
+            try:
+                path, audio, sample_rate, tag = self._chunk_write_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            try:
+                self._write_wav(path, audio, sample_rate)
+                peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+                rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
+                rospy.loginfo("Saved %s chunk: %s (peak=%.6f, rms=%.6f)", tag, path, peak, rms)
+            except Exception as exc:
+                rospy.logwarn("Failed to save %s chunk %s: %s", tag, path, exc)
+            finally:
+                self._chunk_write_queue.task_done()
 
     def _save_detected_chunk(self, audio: np.ndarray, label: str, score: float) -> None:
         if not self.save_detected_chunks:
@@ -221,17 +249,29 @@ class DirectI2SVoiceNode:
             label=label,
             score=score,
         )
-        self._write_wav(path, audio, SAMPLE_RATE)
-        rospy.loginfo("Saved detected chunk: %s", path)
+        self._enqueue_wav_write(path, audio, SAMPLE_RATE, "detected")
 
     def _read_mono(self) -> np.ndarray | None:
-        length, data = self.pcm.read()
+        try:
+            length, data = self.pcm.read()
+        except alsaaudio.ALSAAudioError as exc:
+            rospy.logwarn_throttle(
+                2.0,
+                "ALSA read failed: %s. If this says capture data too large, lower _period_size, e.g. 512 or 256.",
+                exc,
+            )
+            try:
+                self._recover_pcm()
+            except alsaaudio.ALSAAudioError as recover_exc:
+                rospy.logwarn_throttle(2.0, "Failed to recover ALSA capture stream: %s", recover_exc)
+            return None
+
         if length <= 0:
             if length == -errno.EPIPE:
                 self.alsa_overruns += 1
                 rospy.logwarn_throttle(
                     2.0,
-                    "ALSA overrun while reading I2S (length=%d, count=%d); recovering capture stream. Try _period_size:=1024 or 2048 if this keeps happening.",
+                    "ALSA overrun while reading I2S (length=%d, count=%d); recovering capture stream. Try _period_size:=512, or 256 if your ALSA backend rejects larger blocks.",
                     length,
                     self.alsa_overruns,
                 )

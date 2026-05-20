@@ -37,6 +37,7 @@ EXPECTED_SAMPLES = _voice_node.EXPECTED_SAMPLES
 SAMPLE_RATE = _voice_node.SAMPLE_RATE
 FixedRatioAveragingResampler = _voice_node.FixedRatioAveragingResampler
 KeywordSpotter = _voice_node.KeywordSpotter
+get_spectrogram = _voice_node.get_spectrogram
 StreamingSpectrogram = _voice_node.StreamingSpectrogram
 _get_private_param = _voice_node._get_private_param
 _resolve_package_path = _voice_node._resolve_package_path
@@ -60,6 +61,8 @@ class DirectI2SVoiceNode:
         self.sample_format = str(_get_private_param(("sample_format", "i2s/sample_format"), "S32_LE")).upper()
         self.channel_index = int(_get_private_param(("channel_index", "i2s/channel_index", "ros/audio_channel_index"), 0))
         self.audio_gain = float(_get_private_param(("audio_gain", "ros/audio_gain"), 1.0))
+        self.capture_stats = bool(_get_private_param(("capture_stats", "debug/capture_stats"), False))
+        self.resampler_stats = bool(_get_private_param(("resampler_stats", "debug/resampler_stats"), False))
         self.infer_hop_samples = int(_get_private_param(("infer_hop_samples", "model/infer_hop_samples"), EXPECTED_SAMPLES // 5))
         self.inference_rate = float(_get_private_param(("inference_rate", "model/inference_rate"), 2.0))
         self.threshold = float(_get_private_param(("confidence", "model/confidence"), 0.95))
@@ -91,8 +94,8 @@ class DirectI2SVoiceNode:
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self._pcm_lock = threading.Lock()
         self.pcm = None
+        self.fixed_channel = self.channel_index if 0 <= self.channel_index < self.channels else None
         self.audio_messages = 0
         self.audio_bytes = 0
         self.alsa_overruns = 0
@@ -135,26 +138,20 @@ class DirectI2SVoiceNode:
         rospy.loginfo("Publishing command topic only: %s", self.command_topic)
 
     def _open_pcm(self) -> None:
-        with self._pcm_lock:
-            self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device=self.device)
-            self.pcm.setchannels(self.channels)
-            self.pcm.setrate(self.input_sample_rate)
-            self.pcm.setformat(self.alsa_format)
-            self.pcm.setperiodsize(self.period_size)
+        self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device=self.device)
+        self.pcm.setchannels(self.channels)
+        self.pcm.setrate(self.input_sample_rate)
+        self.pcm.setformat(self.alsa_format)
+        self.pcm.setperiodsize(self.period_size)
 
     def _recover_pcm(self) -> None:
-        with self._pcm_lock:
-            try:
-                if self.pcm is not None:
-                    self.pcm.close()
-            except (AttributeError, alsaaudio.ALSAAudioError):
-                pass
+        try:
+            if self.pcm is not None:
+                self.pcm.close()
+        except (AttributeError, alsaaudio.ALSAAudioError):
+            pass
 
-            self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device=self.device)
-            self.pcm.setchannels(self.channels)
-            self.pcm.setrate(self.input_sample_rate)
-            self.pcm.setformat(self.alsa_format)
-            self.pcm.setperiodsize(self.period_size)
+        self._open_pcm()
 
     def _write_wav(self, path: Path, audio: np.ndarray, sample_rate: int) -> None:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
@@ -182,8 +179,7 @@ class DirectI2SVoiceNode:
 
     def _read_mono(self) -> np.ndarray | None:
         try:
-            with self._pcm_lock:
-                length, data = self.pcm.read()
+            length, data = self.pcm.read()
         except alsaaudio.ALSAAudioError as exc:
             self.alsa_errors += 1
             rospy.logwarn_throttle(2.0, "ALSA read failed in capture thread: %s (count=%d)", exc, self.alsa_errors)
@@ -206,33 +202,38 @@ class DirectI2SVoiceNode:
             rospy.logwarn_throttle(2.0, "ALSA read returned length=%d", length)
             return None
 
-        samples = np.frombuffer(data, dtype=self.dtype).astype(np.float32)
+        samples = np.frombuffer(data, dtype=self.dtype)
         expected_values = int(length) * self.channels
         if samples.size < expected_values:
             rospy.logwarn_throttle(2.0, "Short ALSA block: expected %d values, got %d", expected_values, samples.size)
             return None
 
         samples = samples[:expected_values].reshape(int(length), self.channels)
-        if 0 <= self.channel_index < self.channels:
-            selected_channel = self.channel_index
+        if self.fixed_channel is not None:
+            selected_channel = self.fixed_channel
         else:
-            rms_by_channel = np.sqrt(np.mean(samples * samples, axis=0))
+            float_samples = samples.astype(np.float32)
+            rms_by_channel = np.sqrt(np.mean(float_samples * float_samples, axis=0))
             selected_channel = int(np.argmax(rms_by_channel))
 
-        mono = samples[:, selected_channel] / self.scale
-        mono = np.clip(mono * self.audio_gain, -1.0, 1.0).astype(np.float32)
+        mono = samples[:, selected_channel].astype(np.float32) / self.scale
+        if self.audio_gain != 1.0:
+            mono *= self.audio_gain
+            np.clip(mono, -1.0, 1.0, out=mono)
+
         self.audio_messages += 1
         self.audio_bytes += len(data)
-        rospy.loginfo_throttle(
-            5.0,
-            "Capture alive: messages=%d bytes=%d frames=%d selected_channel=%d peak=%.6f rms=%.6f",
-            self.audio_messages,
-            self.audio_bytes,
-            length,
-            selected_channel,
-            float(np.max(np.abs(mono))) if mono.size else 0.0,
-            float(np.sqrt(np.mean(mono * mono))) if mono.size else 0.0,
-        )
+        if self.capture_stats:
+            rospy.loginfo_throttle(
+                5.0,
+                "Capture alive: messages=%d bytes=%d frames=%d selected_channel=%d peak=%.6f rms=%.6f",
+                self.audio_messages,
+                self.audio_bytes,
+                length,
+                selected_channel,
+                float(np.max(np.abs(mono))) if mono.size else 0.0,
+                float(np.sqrt(np.mean(mono * mono))) if mono.size else 0.0,
+            )
         return mono
 
     def _capture_loop(self) -> None:
@@ -248,15 +249,16 @@ class DirectI2SVoiceNode:
             with self._lock:
                 self.streamer.push_audio(audio_16k)
 
-            rospy.loginfo_throttle(
-                5.0,
-                "Capture resampler: in_total=%d out_total=%d latest_in=%d latest_out=%d pending=%d",
-                self.resampler.input_count,
-                self.resampler.output_count,
-                raw_48k.size,
-                audio_16k.size,
-                self.resampler.pending_samples,
-            )
+            if self.resampler_stats:
+                rospy.loginfo_throttle(
+                    5.0,
+                    "Capture resampler: in_total=%d out_total=%d latest_in=%d latest_out=%d pending=%d",
+                    self.resampler.input_count,
+                    self.resampler.output_count,
+                    raw_48k.size,
+                    audio_16k.size,
+                    self.resampler.pending_samples,
+                )
 
     def on_inference_timer(self, _event=None) -> None:
         with self._lock:
@@ -270,7 +272,8 @@ class DirectI2SVoiceNode:
 
             self.last_inferred_audio_seen = samples_seen
             audio = self.streamer.current_audio()
-            spectrogram = self.streamer.current_spectrogram()
+
+        spectrogram = get_spectrogram(audio)
 
         result = self.spotter.predict_spectrogram(spectrogram)
         label = str(result["label"])

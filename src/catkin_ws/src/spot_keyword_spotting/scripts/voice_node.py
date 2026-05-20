@@ -362,6 +362,7 @@ class VoiceNode:
         self.audio_gain = audio_gain
         self.inference_rate = inference_rate
         self._decimators = {}
+        self._downsample_remainders = {}
         self._lock = threading.Lock()
         self._audio_messages = 0
         self._audio_bytes = 0
@@ -543,11 +544,19 @@ class VoiceNode:
                 SAMPLE_RATE,
                 decimator.factor,
             )
-            # Use block averaging for integer-ratio downsampling. Plain decimation
-            # aliases high-frequency I2S noise into the speech band.
+            # Use block averaging for integer-ratio downsampling. Keep the
+            # remainder between packets; ALSA often gives 256 frames at 48 kHz,
+            # and 256 % 3 == 1. Dropping that sample every packet corrupts time.
+            remainder = self._downsample_remainders.get(input_sample_rate)
+            if remainder is not None and remainder.size:
+                audio = np.concatenate((remainder, audio))
+
             usable = audio.size - (audio.size % decimator.factor)
+            self._downsample_remainders[input_sample_rate] = audio[usable:].copy()
+
             if usable <= 0:
-                return decimator.process(audio)
+                return np.empty(0, dtype=np.float32)
+
             return audio[:usable].reshape(-1, decimator.factor).mean(axis=1).astype(np.float32)
 
         duration = audio.size / float(input_sample_rate)

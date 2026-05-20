@@ -342,14 +342,6 @@ class VoiceNode:
             "/voice/command"
         )
 
-        inference_topic = _get_private_param(
-            ("inference_topic", "ros/inference_topic"),
-            "/voice/inference"
-        )
-
-        publish_inference = bool(
-            _get_private_param(("publish_inference", "ros/publish_inference"), True)
-        )
 
         save_detected_chunks = bool(
             _get_private_param(("save_detected_chunks", "debug/save_detected_chunks"), True)
@@ -446,14 +438,6 @@ class VoiceNode:
             queue_size=10,
         )
 
-        self.inference_publisher = None
-
-        if publish_inference:
-            self.inference_publisher = rospy.Publisher(
-                inference_topic,
-                VoiceCommand,
-                queue_size=10,
-            )
 
         self.subscriber = rospy.Subscriber(
             audio_topic,
@@ -471,8 +455,6 @@ class VoiceNode:
         rospy.loginfo("Keyword spotting node started")
         rospy.loginfo("Subscribing audio topic: %s", audio_topic)
         rospy.loginfo("Publishing command topic: %s", command_topic)
-        if publish_inference:
-            rospy.loginfo("Publishing inference topic: %s", inference_topic)
         rospy.loginfo("Model path: %s", model_path)
         rospy.loginfo(
             "Threshold: %.3f, expected samples: %d, inference hop samples: %d",
@@ -837,11 +819,6 @@ class VoiceNode:
             self._recent_best_score = score
             self._recent_best_label = label
 
-        if self.inference_publisher is not None:
-            inference = VoiceCommand()
-            inference.command = label
-            inference.confidence = score
-            self.inference_publisher.publish(inference)
 
         rospy.loginfo_throttle(
             2.0,

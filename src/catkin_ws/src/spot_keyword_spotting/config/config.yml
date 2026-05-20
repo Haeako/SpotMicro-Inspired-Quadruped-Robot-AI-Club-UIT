@@ -21,3 +21,6 @@ debug:
   record_audio_chunks: true
   audio_chunk_dir: "audio_chunks"
   audio_chunk_seconds: 5.0
+  record_raw_audio_chunks: true
+  raw_audio_chunk_dir: "raw_audio_chunks"
+  raw_audio_chunk_seconds: 5.0

@@ -6,12 +6,18 @@ from __future__ import annotations
 import threading
 import time
 import wave
+from math import gcd
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import rospy
 import rospkg
+
+try:
+    from scipy.signal import resample_poly
+except ImportError:
+    resample_poly = None
 
 from std_msgs.msg import UInt8MultiArray
 from spot_keyword_spotting.msg import VoiceCommand
@@ -272,7 +278,7 @@ class VoiceNode:
         )
 
         infer_hop_samples = int(
-            _get_private_param(("infer_hop_samples", "model/infer_hop_samples"), 1600)
+            _get_private_param(("infer_hop_samples", "model/infer_hop_samples"), 3200)
         )
 
         fallback_audio_channels = int(
@@ -296,11 +302,11 @@ class VoiceNode:
         )
 
         audio_gain = float(
-            _get_private_param(("audio_gain", "ros/audio_gain"), 10.0)
+            _get_private_param(("audio_gain", "ros/audio_gain"), 1.0)
         )
 
         inference_rate = float(
-            _get_private_param(("inference_rate", "model/inference_rate"), 10.0)
+            _get_private_param(("inference_rate", "model/inference_rate"), 5.0)
         )
 
         audio_topic = _get_private_param(
@@ -344,6 +350,19 @@ class VoiceNode:
             _get_private_param(("audio_chunk_seconds", "debug/audio_chunk_seconds"), 5.0)
         )
 
+        record_raw_audio_chunks = bool(
+            _get_private_param(("record_raw_audio_chunks", "debug/record_raw_audio_chunks"), False)
+        )
+
+        raw_audio_chunk_dir = _resolve_package_path(
+            package_root,
+            _get_private_param(("raw_audio_chunk_dir", "debug/raw_audio_chunk_dir"), "raw_audio_chunks"),
+        )
+
+        raw_audio_chunk_seconds = float(
+            _get_private_param(("raw_audio_chunk_seconds", "debug/raw_audio_chunk_seconds"), audio_chunk_seconds)
+        )
+
         self.spotter = KeywordSpotter(
             model_path=model_path,
             labels=labels,
@@ -362,7 +381,7 @@ class VoiceNode:
         self.audio_gain = audio_gain
         self.inference_rate = inference_rate
         self._decimators = {}
-        self._downsample_remainders = {}
+        self._resample_tails = {}
         self._lock = threading.Lock()
         self._audio_messages = 0
         self._audio_bytes = 0
@@ -382,12 +401,21 @@ class VoiceNode:
         self._audio_chunk_buffer = []
         self._audio_chunk_sample_count = 0
         self._saved_audio_chunk_count = 0
+        self.record_raw_audio_chunks = record_raw_audio_chunks
+        self.raw_audio_chunk_dir = raw_audio_chunk_dir
+        self.raw_audio_chunk_seconds = raw_audio_chunk_seconds
+        self._raw_audio_chunk_buffers = {}
+        self._raw_audio_chunk_sample_counts = {}
+        self._saved_raw_audio_chunk_counts = {}
 
         if self.save_detected_chunks:
             self.detected_chunk_dir.mkdir(parents=True, exist_ok=True)
 
         if self.record_audio_chunks:
             self.audio_chunk_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.record_raw_audio_chunks:
+            self.raw_audio_chunk_dir.mkdir(parents=True, exist_ok=True)
 
         self.publisher = rospy.Publisher(
             command_topic,
@@ -436,14 +464,21 @@ class VoiceNode:
             rospy.loginfo("Saving detected chunks to: %s", self.detected_chunk_dir)
         if self.record_audio_chunks:
             rospy.loginfo(
-                "Recording continuous audio chunks to: %s (%d samples/chunk)",
+                "Recording post-resample audio chunks to: %s (%d samples/chunk @ %d Hz)",
                 self.audio_chunk_dir,
                 self.audio_chunk_samples,
+                SAMPLE_RATE,
+            )
+        if self.record_raw_audio_chunks:
+            rospy.loginfo(
+                "Recording raw parsed audio chunks to: %s (%.2fs/chunk, original sample rate)",
+                self.raw_audio_chunk_dir,
+                self.raw_audio_chunk_seconds,
             )
 
 
 
-    def _write_wav(self, path: Path, audio: np.ndarray) -> None:
+    def _write_wav(self, path: Path, audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> None:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         audio = np.clip(audio, -1.0, 1.0)
         pcm = (audio * 32767.0).astype("<i2")
@@ -451,8 +486,60 @@ class VoiceNode:
         with wave.open(str(path), "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
-            wav.setframerate(SAMPLE_RATE)
+            wav.setframerate(int(sample_rate))
             wav.writeframes(pcm.tobytes())
+
+
+    def _record_raw_audio_chunk(self, audio: np.ndarray, sample_rate: int) -> None:
+        if not self.record_raw_audio_chunks:
+            return
+
+        sample_rate = int(sample_rate)
+        if sample_rate <= 0:
+            sample_rate = SAMPLE_RATE
+
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return
+
+        if sample_rate not in self._raw_audio_chunk_buffers:
+            self._raw_audio_chunk_buffers[sample_rate] = []
+            self._raw_audio_chunk_sample_counts[sample_rate] = 0
+            self._saved_raw_audio_chunk_counts[sample_rate] = 0
+
+        target_samples = max(1, int(self.raw_audio_chunk_seconds * sample_rate))
+        self._raw_audio_chunk_buffers[sample_rate].append(audio.copy())
+        self._raw_audio_chunk_sample_counts[sample_rate] += int(audio.size)
+
+        while self._raw_audio_chunk_sample_counts[sample_rate] >= target_samples:
+            merged = np.concatenate(self._raw_audio_chunk_buffers[sample_rate])
+            chunk = merged[:target_samples]
+            remaining = merged[target_samples:]
+
+            self._raw_audio_chunk_buffers[sample_rate] = [remaining] if remaining.size else []
+            self._raw_audio_chunk_sample_counts[sample_rate] = int(remaining.size)
+            self._saved_raw_audio_chunk_counts[sample_rate] += 1
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = "{stamp}_raw_{rate}hz_{idx:04d}.wav".format(
+                stamp=timestamp,
+                rate=sample_rate,
+                idx=self._saved_raw_audio_chunk_counts[sample_rate],
+            )
+            path = self.raw_audio_chunk_dir / filename
+            self._write_wav(path, chunk, sample_rate=sample_rate)
+
+            peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+            rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
+            clip_ratio = float(np.mean(np.abs(chunk) >= 0.999)) if chunk.size else 0.0
+            rospy.loginfo(
+                "Saved raw audio chunk: %s (rate=%d, peak=%.6f, rms=%.6f, clip_ratio=%.4f)",
+                path,
+                sample_rate,
+                peak,
+                rms,
+                clip_ratio,
+            )
 
     def _record_audio_chunk(self, audio: np.ndarray) -> None:
         if not self.record_audio_chunks:
@@ -480,7 +567,7 @@ class VoiceNode:
                 idx=self._saved_audio_chunk_count,
             )
             path = self.audio_chunk_dir / filename
-            self._write_wav(path, chunk)
+            self._write_wav(path, chunk, sample_rate=SAMPLE_RATE)
 
             peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
             rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
@@ -505,7 +592,7 @@ class VoiceNode:
         )
         path = self.detected_chunk_dir / filename
 
-        self._write_wav(path, audio)
+        self._write_wav(path, audio, sample_rate=SAMPLE_RATE)
 
         rospy.loginfo("Saved detected chunk: %s", path)
 
@@ -517,6 +604,8 @@ class VoiceNode:
         return None
 
     def _resample_to_model_rate(self, audio: np.ndarray, input_sample_rate: int) -> np.ndarray:
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+
         if input_sample_rate == SAMPLE_RATE:
             return audio
 
@@ -529,47 +618,82 @@ class VoiceNode:
             )
             return audio
 
-        if input_sample_rate % SAMPLE_RATE == 0:
-            if input_sample_rate not in self._decimators:
-                self._decimators[input_sample_rate] = StreamingDecimator(
-                    input_sample_rate,
-                    SAMPLE_RATE,
-                )
+        if audio.size == 0:
+            return audio
 
-            decimator = self._decimators[input_sample_rate]
+        factor_gcd = gcd(int(input_sample_rate), int(SAMPLE_RATE))
+        up = int(SAMPLE_RATE // factor_gcd)
+        down = int(input_sample_rate // factor_gcd)
+
+        if resample_poly is not None:
+            # Keep a short overlap so the polyphase filter has continuity across
+            # ALSA packets. Without this, every packet boundary can sound like a
+            # timebase glitch or a small discontinuity.
+            tail = self._resample_tails.get(input_sample_rate)
+            if tail is not None and tail.size:
+                padded = np.concatenate((tail, audio))
+                tail_input_count = int(tail.size)
+            else:
+                padded = audio
+                tail_input_count = 0
+
+            converted = resample_poly(padded, up, down).astype(np.float32)
+            skip = int(round(tail_input_count * SAMPLE_RATE / float(input_sample_rate)))
+            converted = converted[skip:] if skip > 0 else converted
+
+            tail_size = min(int(input_sample_rate * 0.03), padded.size)
+            self._resample_tails[input_sample_rate] = padded[-tail_size:].copy()
+
             rospy.loginfo_throttle(
                 5.0,
-                "Downsampled audio from %d Hz to %d Hz by factor %d",
+                "Resampled audio from %d Hz to %d Hz using polyphase up=%d down=%d",
                 input_sample_rate,
                 SAMPLE_RATE,
-                decimator.factor,
+                up,
+                down,
             )
-            # Use block averaging for integer-ratio downsampling. Keep the
-            # remainder between packets; ALSA often gives 256 frames at 48 kHz,
-            # and 256 % 3 == 1. Dropping that sample every packet corrupts time.
-            remainder = self._downsample_remainders.get(input_sample_rate)
-            if remainder is not None and remainder.size:
-                audio = np.concatenate((remainder, audio))
+            return converted
 
-            usable = audio.size - (audio.size % decimator.factor)
-            self._downsample_remainders[input_sample_rate] = audio[usable:].copy()
+        # Fallback without SciPy: continuous linear interpolation with a carried
+        # source-time cursor. This preserves duration better than dropping packet
+        # remainders.
+        key = ("linear", input_sample_rate)
+        state = self._resample_tails.get(key)
+        if state is None:
+            last_sample = np.empty(0, dtype=np.float32)
+            phase = 0.0
+        else:
+            last_sample, phase = state
 
-            if usable <= 0:
-                return np.empty(0, dtype=np.float32)
+        if last_sample.size:
+            audio = np.concatenate((last_sample, audio))
+            phase += 1.0
 
-            return audio[:usable].reshape(-1, decimator.factor).mean(axis=1).astype(np.float32)
+        step = input_sample_rate / float(SAMPLE_RATE)
+        positions = []
+        pos = phase
+        limit = audio.size - 1
+        while pos < limit:
+            positions.append(pos)
+            pos += step
 
-        duration = audio.size / float(input_sample_rate)
-        output_size = max(1, int(round(duration * SAMPLE_RATE)))
-        source_x = np.linspace(0.0, duration, num=audio.size, endpoint=False)
-        target_x = np.linspace(0.0, duration, num=output_size, endpoint=False)
+        if positions:
+            positions = np.asarray(positions, dtype=np.float32)
+            left = np.floor(positions).astype(np.int64)
+            frac = positions - left
+            out = audio[left] * (1.0 - frac) + audio[left + 1] * frac
+            out = out.astype(np.float32)
+        else:
+            out = np.empty(0, dtype=np.float32)
+
+        self._resample_tails[key] = (audio[-1:].copy(), pos - (audio.size - 1))
         rospy.loginfo_throttle(
             5.0,
-            "Resampled audio from %d Hz to %d Hz",
+            "Resampled audio from %d Hz to %d Hz using linear fallback",
             input_sample_rate,
             SAMPLE_RATE,
         )
-        return np.interp(target_x, source_x, audio).astype(np.float32)
+        return out
 
     def on_audio(self, msg: UInt8MultiArray) -> None:
         raw = np.frombuffer(
@@ -685,6 +809,7 @@ class VoiceNode:
         if input_sample_rate is None:
             input_sample_rate = self.fallback_input_sample_rate
 
+        self._record_raw_audio_chunk(audio, input_sample_rate)
         audio = self._resample_to_model_rate(audio, input_sample_rate)
         self._record_audio_chunk(audio)
 

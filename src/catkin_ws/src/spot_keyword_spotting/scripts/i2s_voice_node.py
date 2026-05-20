@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import errno
+import importlib.util
+import threading
+import sys
 import time
 import wave
 from pathlib import Path
@@ -14,16 +18,27 @@ import rospy
 import rospkg
 
 from spot_keyword_spotting.msg import VoiceCommand
-from voice_node import (
-    DEFAULT_LABELS,
-    EXPECTED_SAMPLES,
-    SAMPLE_RATE,
-    FixedRatioAveragingResampler,
-    KeywordSpotter,
-    StreamingSpectrogram,
-    _get_private_param,
-    _resolve_package_path,
-)
+def _load_voice_node_helpers():
+    script_path = Path(__file__).resolve().parent / "voice_node.py"
+    spec = importlib.util.spec_from_file_location("spot_kws_voice_node_source", str(script_path))
+    if spec is None or spec.loader is None:
+        raise ImportError("Cannot load voice_node.py from {}".format(script_path))
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_voice_node = _load_voice_node_helpers()
+DEFAULT_LABELS = _voice_node.DEFAULT_LABELS
+EXPECTED_SAMPLES = _voice_node.EXPECTED_SAMPLES
+SAMPLE_RATE = _voice_node.SAMPLE_RATE
+FixedRatioAveragingResampler = _voice_node.FixedRatioAveragingResampler
+KeywordSpotter = _voice_node.KeywordSpotter
+StreamingSpectrogram = _voice_node.StreamingSpectrogram
+_get_private_param = _voice_node._get_private_param
+_resolve_package_path = _voice_node._resolve_package_path
 
 
 SAMPLE_FORMATS = {
@@ -48,11 +63,12 @@ class DirectI2SVoiceNode:
         self.threshold = float(_get_private_param(("confidence", "model/confidence"), 0.95))
         self.labels = tuple(_get_private_param(("labels", "model/labels"), DEFAULT_LABELS))
         self.num_threads = int(_get_private_param(("num_threads", "model/num_threads"), 2))
+        self.inference_rate = float(_get_private_param(("inference_rate", "model/inference_rate"), 5.0))
         self.publish_inference = bool(_get_private_param(("publish_inference", "ros/publish_inference"), True))
         self.command_topic = _get_private_param(("command_topic", "ros/publish_topic"), "/voice/command")
         self.inference_topic = _get_private_param(("inference_topic", "ros/inference_topic"), "/voice/inference")
-        self.record_audio_chunks = bool(_get_private_param(("record_audio_chunks", "debug/record_audio_chunks"), True))
-        self.record_raw_audio_chunks = bool(_get_private_param(("record_raw_audio_chunks", "debug/record_raw_audio_chunks"), True))
+        self.record_audio_chunks = bool(_get_private_param(("record_audio_chunks", "debug/record_audio_chunks"), False))
+        self.record_raw_audio_chunks = bool(_get_private_param(("record_raw_audio_chunks", "debug/record_raw_audio_chunks"), False))
         self.audio_chunk_seconds = float(_get_private_param(("audio_chunk_seconds", "debug/audio_chunk_seconds"), 5.0))
         self.raw_audio_chunk_seconds = float(_get_private_param(("raw_audio_chunk_seconds", "debug/raw_audio_chunk_seconds"), self.audio_chunk_seconds))
         self.audio_chunk_dir = _resolve_package_path(package_root, _get_private_param(("audio_chunk_dir", "debug/audio_chunk_dir"), "audio_chunks"))
@@ -93,6 +109,8 @@ class DirectI2SVoiceNode:
         self.best_score = 0.0
         self.best_label = "background"
         self.last_inferred_audio_seen = 0
+        self.alsa_overruns = 0
+        self._lock = threading.Lock()
 
         for directory, enabled in (
             (self.audio_chunk_dir, self.record_audio_chunks),
@@ -102,11 +120,8 @@ class DirectI2SVoiceNode:
             if enabled:
                 directory.mkdir(parents=True, exist_ok=True)
 
-        self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device=self.device)
-        self.pcm.setchannels(self.channels)
-        self.pcm.setrate(self.input_sample_rate)
-        self.pcm.setformat(self.alsa_format)
-        self.pcm.setperiodsize(self.period_size)
+        self.pcm = None
+        self._open_pcm()
 
         rospy.loginfo(
             "Direct I2S KWS started: device=%s, rate=%d, channels=%d, format=%s, period=%d, channel_index=%d",
@@ -120,7 +135,27 @@ class DirectI2SVoiceNode:
         rospy.loginfo("Model path: %s", model_path)
         rospy.loginfo("Threshold: %.3f, expected samples: %d, inference hop samples: %d", self.threshold, EXPECTED_SAMPLES, self.infer_hop_samples)
         rospy.loginfo("Audio gain: %.3f", self.audio_gain)
+        rospy.loginfo("Inference timer rate: %.3f Hz", self.inference_rate)
+        self.timer = rospy.Timer(
+            rospy.Duration(1.0 / max(0.1, self.inference_rate)),
+            self.on_inference_timer,
+        )
 
+    def _open_pcm(self) -> None:
+        self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device=self.device)
+        self.pcm.setchannels(self.channels)
+        self.pcm.setrate(self.input_sample_rate)
+        self.pcm.setformat(self.alsa_format)
+        self.pcm.setperiodsize(self.period_size)
+
+    def _recover_pcm(self) -> None:
+        try:
+            if self.pcm is not None:
+                self.pcm.close()
+        except (AttributeError, alsaaudio.ALSAAudioError):
+            pass
+
+        self._open_pcm()
     def _write_wav(self, path: Path, audio: np.ndarray, sample_rate: int) -> None:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         audio = np.clip(audio, -1.0, 1.0)
@@ -192,6 +227,20 @@ class DirectI2SVoiceNode:
     def _read_mono(self) -> np.ndarray | None:
         length, data = self.pcm.read()
         if length <= 0:
+            if length == -errno.EPIPE:
+                self.alsa_overruns += 1
+                rospy.logwarn_throttle(
+                    2.0,
+                    "ALSA overrun while reading I2S (length=%d, count=%d); recovering capture stream. Try _period_size:=1024 or 2048 if this keeps happening.",
+                    length,
+                    self.alsa_overruns,
+                )
+                try:
+                    self._recover_pcm()
+                except alsaaudio.ALSAAudioError as exc:
+                    rospy.logwarn_throttle(2.0, "Failed to recover ALSA capture stream: %s", exc)
+                return None
+
             rospy.logwarn_throttle(2.0, "ALSA read returned length=%d", length)
             return None
 
@@ -221,18 +270,21 @@ class DirectI2SVoiceNode:
         )
         return mono
 
-    def _maybe_infer(self) -> None:
-        if not self.streamer.ready:
-            return
+    def on_inference_timer(self, _event=None) -> None:
+        with self._lock:
+            if not self.streamer.ready:
+                return
 
-        samples_seen = self.streamer.ring.samples_seen()
-        new_samples = samples_seen - self.last_inferred_audio_seen
-        if new_samples < self.infer_hop_samples:
-            return
+            samples_seen = self.streamer.ring.samples_seen()
+            new_samples = samples_seen - self.last_inferred_audio_seen
+            if new_samples < self.infer_hop_samples:
+                return
 
-        self.last_inferred_audio_seen = samples_seen
-        audio = self.streamer.current_audio()
-        result = self.spotter.predict_spectrogram(self.streamer.current_spectrogram())
+            self.last_inferred_audio_seen = samples_seen
+            audio = self.streamer.current_audio()
+            spectrogram = self.streamer.current_spectrogram()
+
+        result = self.spotter.predict_spectrogram(spectrogram)
         label = str(result["label"])
         score = float(result["score"])
         self.inference_count += 1
@@ -277,7 +329,8 @@ class DirectI2SVoiceNode:
             self._record_chunk(raw_48k, self.input_sample_rate, is_raw=True)
             audio_16k = self.resampler.process(raw_48k)
             self._record_chunk(audio_16k, SAMPLE_RATE, is_raw=False)
-            self.streamer.push_audio(audio_16k)
+            with self._lock:
+                self.streamer.push_audio(audio_16k)
             rospy.loginfo_throttle(
                 5.0,
                 "Direct resampler: in_total=%d out_total=%d latest_in=%d latest_out=%d pending=%d",
@@ -287,7 +340,6 @@ class DirectI2SVoiceNode:
                 audio_16k.size,
                 self.resampler.pending_samples,
             )
-            self._maybe_infer()
 
 
 def main() -> None:

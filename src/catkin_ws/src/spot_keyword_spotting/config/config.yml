@@ -14,3 +14,6 @@ ros:
   sample_width_bytes: 4
   audio_channel_index: -1
   audio_gain: 1.0
+debug:
+  save_detected_chunks: true
+  detected_chunk_dir: "detected_chunks"

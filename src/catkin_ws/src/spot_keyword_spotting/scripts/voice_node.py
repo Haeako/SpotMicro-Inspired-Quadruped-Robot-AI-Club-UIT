@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import threading
+import time
+import wave
 from pathlib import Path
 from typing import Iterable
 
@@ -316,6 +318,15 @@ class VoiceNode:
             _get_private_param(("publish_inference", "ros/publish_inference"), True)
         )
 
+        save_detected_chunks = bool(
+            _get_private_param(("save_detected_chunks", "debug/save_detected_chunks"), False)
+        )
+
+        detected_chunk_dir = _resolve_package_path(
+            package_root,
+            _get_private_param(("detected_chunk_dir", "debug/detected_chunk_dir"), "detected_chunks"),
+        )
+
         self.spotter = KeywordSpotter(
             model_path=model_path,
             labels=labels,
@@ -343,6 +354,12 @@ class VoiceNode:
         self._recent_best_label = "background"
         self._recent_best_started = rospy.Time.now()
         self._last_inferred_audio_seen = 0
+        self.save_detected_chunks = save_detected_chunks
+        self.detected_chunk_dir = detected_chunk_dir
+        self._saved_chunk_count = 0
+
+        if self.save_detected_chunks:
+            self.detected_chunk_dir.mkdir(parents=True, exist_ok=True)
 
         self.publisher = rospy.Publisher(
             command_topic,
@@ -386,6 +403,35 @@ class VoiceNode:
         )
         rospy.loginfo("Audio gain: %.3f", self.audio_gain)
         rospy.loginfo("Inference rate: %.3f Hz", self.inference_rate)
+        if self.save_detected_chunks:
+            rospy.loginfo("Saving detected chunks to: %s", self.detected_chunk_dir)
+
+
+    def _save_detected_chunk(self, audio: np.ndarray, label: str, score: float) -> None:
+        if not self.save_detected_chunks:
+            return
+
+        self._saved_chunk_count += 1
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = "{stamp}_{idx:04d}_{label}_{score:.3f}.wav".format(
+            stamp=timestamp,
+            idx=self._saved_chunk_count,
+            label=label,
+            score=score,
+        )
+        path = self.detected_chunk_dir / filename
+
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        audio = np.clip(audio, -1.0, 1.0)
+        pcm = (audio * 32767.0).astype("<i2")
+
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(SAMPLE_RATE)
+            wav.writeframes(pcm.tobytes())
+
+        rospy.loginfo("Saved detected chunk: %s", path)
 
     def _layout_dim_size(self, msg: UInt8MultiArray, label: str) -> int | None:
         for dim in msg.layout.dim:
@@ -620,6 +666,7 @@ class VoiceNode:
         command.confidence = score
 
         self.publisher.publish(command)
+        self._save_detected_chunk(audio, label, score)
 
         rospy.loginfo(
             "Detected: %s (%.3f)",

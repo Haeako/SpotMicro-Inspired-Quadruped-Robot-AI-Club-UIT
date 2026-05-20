@@ -14,11 +14,6 @@ import numpy as np
 import rospy
 import rospkg
 
-try:
-    from scipy.signal import resample_poly
-except ImportError:
-    resample_poly = None
-
 from std_msgs.msg import UInt8MultiArray
 from spot_keyword_spotting.msg import VoiceCommand
 
@@ -290,7 +285,11 @@ class VoiceNode:
         )
 
         fallback_input_sample_rate = int(
-            _get_private_param(("input_sample_rate", "ros/input_sample_rate"), SAMPLE_RATE)
+            _get_private_param(("input_sample_rate", "ros/input_sample_rate"), 48000)
+        )
+
+        force_input_sample_rate = int(
+            _get_private_param(("force_input_sample_rate", "ros/force_input_sample_rate"), fallback_input_sample_rate)
         )
 
         s32_shift_bits = int(
@@ -376,6 +375,7 @@ class VoiceNode:
         self.fallback_audio_channels = max(1, fallback_audio_channels)
         self.fallback_sample_width_bytes = fallback_sample_width_bytes
         self.fallback_input_sample_rate = fallback_input_sample_rate
+        self.force_input_sample_rate = force_input_sample_rate
         self.s32_shift_bits = s32_shift_bits
         self.audio_channel_index = audio_channel_index
         self.audio_gain = audio_gain
@@ -458,6 +458,7 @@ class VoiceNode:
             self.streamer.emit_hop_samples,
         )
         rospy.loginfo("Audio gain: %.3f", self.audio_gain)
+        rospy.loginfo("Input sample rate fallback/forced: %d/%d", self.fallback_input_sample_rate, self.force_input_sample_rate)
         rospy.loginfo("S32 shift bits: %d", self.s32_shift_bits)
         rospy.loginfo("Inference rate: %.3f Hz", self.inference_rate)
         if self.save_detected_chunks:
@@ -605,95 +606,43 @@ class VoiceNode:
 
     def _resample_to_model_rate(self, audio: np.ndarray, input_sample_rate: int) -> np.ndarray:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-
-        if input_sample_rate == SAMPLE_RATE:
-            return audio
-
-        if input_sample_rate <= 0:
-            rospy.logwarn_throttle(
-                5.0,
-                "Invalid input sample rate %d; assuming model rate %d",
-                input_sample_rate,
-                SAMPLE_RATE,
-            )
-            return audio
+        input_sample_rate = int(input_sample_rate)
 
         if audio.size == 0:
             return audio
 
-        factor_gcd = gcd(int(input_sample_rate), int(SAMPLE_RATE))
-        up = int(SAMPLE_RATE // factor_gcd)
-        down = int(input_sample_rate // factor_gcd)
+        if input_sample_rate == SAMPLE_RATE:
+            return audio
 
-        if resample_poly is not None:
-            # Keep a short overlap so the polyphase filter has continuity across
-            # ALSA packets. Without this, every packet boundary can sound like a
-            # timebase glitch or a small discontinuity.
-            tail = self._resample_tails.get(input_sample_rate)
+        if input_sample_rate == 48000 and SAMPLE_RATE == 16000:
+            key = "48k_to_16k_average3"
+            tail = self._resample_tails.get(key)
             if tail is not None and tail.size:
-                padded = np.concatenate((tail, audio))
-                tail_input_count = int(tail.size)
-            else:
-                padded = audio
-                tail_input_count = 0
+                audio = np.concatenate((tail, audio))
 
-            converted = resample_poly(padded, up, down).astype(np.float32)
-            skip = int(round(tail_input_count * SAMPLE_RATE / float(input_sample_rate)))
-            converted = converted[skip:] if skip > 0 else converted
+            usable = audio.size - (audio.size % 3)
+            self._resample_tails[key] = audio[usable:].copy()
 
-            tail_size = min(int(input_sample_rate * 0.03), padded.size)
-            self._resample_tails[input_sample_rate] = padded[-tail_size:].copy()
+            if usable <= 0:
+                return np.empty(0, dtype=np.float32)
 
+            out = audio[:usable].reshape(-1, 3).mean(axis=1).astype(np.float32)
             rospy.loginfo_throttle(
                 5.0,
-                "Resampled audio from %d Hz to %d Hz using polyphase up=%d down=%d",
-                input_sample_rate,
-                SAMPLE_RATE,
-                up,
-                down,
+                "Downsampled exact 48k->16k: in=%d usable=%d out=%d tail=%d",
+                audio.size,
+                usable,
+                out.size,
+                self._resample_tails[key].size,
             )
-            return converted
+            return out
 
-        # Fallback without SciPy: continuous linear interpolation with a carried
-        # source-time cursor. This preserves duration better than dropping packet
-        # remainders.
-        key = ("linear", input_sample_rate)
-        state = self._resample_tails.get(key)
-        if state is None:
-            last_sample = np.empty(0, dtype=np.float32)
-            phase = 0.0
-        else:
-            last_sample, phase = state
-
-        if last_sample.size:
-            audio = np.concatenate((last_sample, audio))
-            phase += 1.0
-
-        step = input_sample_rate / float(SAMPLE_RATE)
-        positions = []
-        pos = phase
-        limit = audio.size - 1
-        while pos < limit:
-            positions.append(pos)
-            pos += step
-
-        if positions:
-            positions = np.asarray(positions, dtype=np.float32)
-            left = np.floor(positions).astype(np.int64)
-            frac = positions - left
-            out = audio[left] * (1.0 - frac) + audio[left + 1] * frac
-            out = out.astype(np.float32)
-        else:
-            out = np.empty(0, dtype=np.float32)
-
-        self._resample_tails[key] = (audio[-1:].copy(), pos - (audio.size - 1))
-        rospy.loginfo_throttle(
-            5.0,
-            "Resampled audio from %d Hz to %d Hz using linear fallback",
+        rospy.logwarn_throttle(
+            2.0,
+            "Unsupported input_sample_rate=%d for realtime KWS; expected 48000 or 16000. Passing audio through unchanged.",
             input_sample_rate,
-            SAMPLE_RATE,
         )
-        return out
+        return audio
 
     def on_audio(self, msg: UInt8MultiArray) -> None:
         raw = np.frombuffer(
@@ -709,6 +658,12 @@ class VoiceNode:
             self._audio_messages,
             self._audio_bytes,
             raw.size,
+        )
+
+        rospy.loginfo_throttle(
+            5.0,
+            "Audio layout dims: %s",
+            ", ".join("{}={}".format(dim.label, dim.size) for dim in msg.layout.dim),
         )
 
         if raw.size < 2:
@@ -804,10 +759,19 @@ class VoiceNode:
                 rms,
             )
 
-        input_sample_rate = self._layout_dim_size(msg, "sample_rate")
+        msg_sample_rate = self._layout_dim_size(msg, "sample_rate")
 
-        if input_sample_rate is None:
-            input_sample_rate = self.fallback_input_sample_rate
+        if msg_sample_rate is None:
+            msg_sample_rate = self.fallback_input_sample_rate
+
+        input_sample_rate = self.force_input_sample_rate or msg_sample_rate
+        if input_sample_rate != msg_sample_rate:
+            rospy.logwarn_throttle(
+                5.0,
+                "Forcing input sample rate to %d Hz (message reported %d Hz)",
+                input_sample_rate,
+                msg_sample_rate,
+            )
 
         self._record_raw_audio_chunk(audio, input_sample_rate)
         audio = self._resample_to_model_rate(audio, input_sample_rate)

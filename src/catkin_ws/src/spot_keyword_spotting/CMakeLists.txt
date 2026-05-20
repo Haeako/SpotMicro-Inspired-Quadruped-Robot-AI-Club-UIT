@@ -49,11 +49,7 @@ add_executable(i2s_window_node
 add_dependencies(i2s_window_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(i2s_window_node ${catkin_LIBRARIES} ${CMAKE_DL_LIBS})
 catkin_install_python(PROGRAMS
-  scripts/infer_wav.py
-  scripts/voice_node.py
   scripts/i2s_voice_node.py
-  scripts/i2s_window_node.py
-  scripts/window_infer_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

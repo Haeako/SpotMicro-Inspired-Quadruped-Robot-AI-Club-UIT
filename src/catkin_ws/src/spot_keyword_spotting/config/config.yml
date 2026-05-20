@@ -17,3 +17,6 @@ ros:
 debug:
   save_detected_chunks: true
   detected_chunk_dir: "detected_chunks"
+  record_audio_chunks: true
+  audio_chunk_dir: "audio_chunks"
+  audio_chunk_seconds: 5.0

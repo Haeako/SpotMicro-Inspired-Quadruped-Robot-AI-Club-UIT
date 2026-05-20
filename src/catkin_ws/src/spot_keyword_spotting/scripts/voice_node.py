@@ -327,6 +327,19 @@ class VoiceNode:
             _get_private_param(("detected_chunk_dir", "debug/detected_chunk_dir"), "detected_chunks"),
         )
 
+        record_audio_chunks = bool(
+            _get_private_param(("record_audio_chunks", "debug/record_audio_chunks"), False)
+        )
+
+        audio_chunk_dir = _resolve_package_path(
+            package_root,
+            _get_private_param(("audio_chunk_dir", "debug/audio_chunk_dir"), "audio_chunks"),
+        )
+
+        audio_chunk_seconds = float(
+            _get_private_param(("audio_chunk_seconds", "debug/audio_chunk_seconds"), 5.0)
+        )
+
         self.spotter = KeywordSpotter(
             model_path=model_path,
             labels=labels,
@@ -357,9 +370,18 @@ class VoiceNode:
         self.save_detected_chunks = save_detected_chunks
         self.detected_chunk_dir = detected_chunk_dir
         self._saved_chunk_count = 0
+        self.record_audio_chunks = record_audio_chunks
+        self.audio_chunk_dir = audio_chunk_dir
+        self.audio_chunk_samples = max(1, int(audio_chunk_seconds * SAMPLE_RATE))
+        self._audio_chunk_buffer = []
+        self._audio_chunk_sample_count = 0
+        self._saved_audio_chunk_count = 0
 
         if self.save_detected_chunks:
             self.detected_chunk_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.record_audio_chunks:
+            self.audio_chunk_dir.mkdir(parents=True, exist_ok=True)
 
         self.publisher = rospy.Publisher(
             command_topic,
@@ -405,7 +427,62 @@ class VoiceNode:
         rospy.loginfo("Inference rate: %.3f Hz", self.inference_rate)
         if self.save_detected_chunks:
             rospy.loginfo("Saving detected chunks to: %s", self.detected_chunk_dir)
+        if self.record_audio_chunks:
+            rospy.loginfo(
+                "Recording continuous audio chunks to: %s (%d samples/chunk)",
+                self.audio_chunk_dir,
+                self.audio_chunk_samples,
+            )
 
+
+
+    def _write_wav(self, path: Path, audio: np.ndarray) -> None:
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        audio = np.clip(audio, -1.0, 1.0)
+        pcm = (audio * 32767.0).astype("<i2")
+
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(SAMPLE_RATE)
+            wav.writeframes(pcm.tobytes())
+
+    def _record_audio_chunk(self, audio: np.ndarray) -> None:
+        if not self.record_audio_chunks:
+            return
+
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size == 0:
+            return
+
+        self._audio_chunk_buffer.append(audio.copy())
+        self._audio_chunk_sample_count += int(audio.size)
+
+        while self._audio_chunk_sample_count >= self.audio_chunk_samples:
+            merged = np.concatenate(self._audio_chunk_buffer)
+            chunk = merged[:self.audio_chunk_samples]
+            remaining = merged[self.audio_chunk_samples:]
+
+            self._audio_chunk_buffer = [remaining] if remaining.size else []
+            self._audio_chunk_sample_count = int(remaining.size)
+            self._saved_audio_chunk_count += 1
+
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            filename = "{stamp}_stream_{idx:04d}.wav".format(
+                stamp=timestamp,
+                idx=self._saved_audio_chunk_count,
+            )
+            path = self.audio_chunk_dir / filename
+            self._write_wav(path, chunk)
+
+            peak = float(np.max(np.abs(chunk))) if chunk.size else 0.0
+            rms = float(np.sqrt(np.mean(chunk * chunk))) if chunk.size else 0.0
+            rospy.loginfo(
+                "Saved audio chunk: %s (peak=%.6f, rms=%.6f)",
+                path,
+                peak,
+                rms,
+            )
 
     def _save_detected_chunk(self, audio: np.ndarray, label: str, score: float) -> None:
         if not self.save_detected_chunks:
@@ -421,15 +498,7 @@ class VoiceNode:
         )
         path = self.detected_chunk_dir / filename
 
-        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-        audio = np.clip(audio, -1.0, 1.0)
-        pcm = (audio * 32767.0).astype("<i2")
-
-        with wave.open(str(path), "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(SAMPLE_RATE)
-            wav.writeframes(pcm.tobytes())
+        self._write_wav(path, audio)
 
         rospy.loginfo("Saved detected chunk: %s", path)
 
@@ -591,6 +660,7 @@ class VoiceNode:
             input_sample_rate = self.fallback_input_sample_rate
 
         audio = self._resample_to_model_rate(audio, input_sample_rate)
+        self._record_audio_chunk(audio)
 
         with self._lock:
             self.streamer.push_audio(audio)

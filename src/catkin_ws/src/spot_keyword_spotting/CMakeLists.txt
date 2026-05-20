@@ -12,6 +12,10 @@ find_package(catkin REQUIRED COMPONENTS
 )
 
 find_package(pybind11 REQUIRED)
+find_library(ASOUND_LIBRARY asound)
+if(NOT ASOUND_LIBRARY)
+  message(FATAL_ERROR "Could not find ALSA asound library")
+endif()
 
 add_message_files(
   FILES
@@ -43,13 +47,22 @@ set_target_properties(kws_native PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CATKIN_DEVEL_PREFIX}/${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+add_executable(i2s_window_node
+  src/i2s_window_node.cpp
+)
+add_dependencies(i2s_window_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(i2s_window_node ${catkin_LIBRARIES} ${ASOUND_LIBRARY})
 catkin_install_python(PROGRAMS
   scripts/infer_wav.py
   scripts/voice_node.py
   scripts/i2s_voice_node.py
+  scripts/window_infer_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
+install(TARGETS i2s_window_node
+  RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
 install(TARGETS kws_native
   LIBRARY DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

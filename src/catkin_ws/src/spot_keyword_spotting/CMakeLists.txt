@@ -44,6 +44,7 @@ set_target_properties(kws_native PROPERTIES
 )
 
 catkin_install_python(PROGRAMS
+  scripts/infer_wav.py
   scripts/voice_node.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )

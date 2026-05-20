@@ -44,6 +44,20 @@ class I2SMicNode:
             queue_size=2
         )
 
+        self.mic = None
+        self._open_mic()
+
+        rospy.loginfo(
+            "I2S mic started: device=%s, topic=%s, sample_rate=%d, channels=%d, sample_format=%s, period_size=%d",
+            self.device,
+            self.audio_topic,
+            self.sample_rate,
+            self.channels,
+            self.sample_format,
+            self.period_size,
+        )
+
+    def _open_mic(self):
         try:
             self.mic = alsaaudio.PCM(
                 alsaaudio.PCM_CAPTURE,
@@ -63,15 +77,14 @@ class I2SMicNode:
             )
             raise
 
-        rospy.loginfo(
-            "I2S mic started: device=%s, topic=%s, sample_rate=%d, channels=%d, sample_format=%s, period_size=%d",
-            self.device,
-            self.audio_topic,
-            self.sample_rate,
-            self.channels,
-            self.sample_format,
-            self.period_size,
-        )
+    def _recover_mic(self):
+        try:
+            if self.mic is not None:
+                self.mic.close()
+        except (AttributeError, alsaaudio.ALSAAudioError):
+            pass
+
+        self._open_mic()
 
     def run(self):
 
@@ -125,7 +138,7 @@ class I2SMicNode:
                         length,
                     )
                     try:
-                        self.mic.prepare()
+                        self._recover_mic()
                     except alsaaudio.ALSAAudioError as exc:
                         rospy.logwarn_throttle(
                             5.0,

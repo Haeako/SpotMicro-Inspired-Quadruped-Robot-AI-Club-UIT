@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Iterable
 
@@ -91,6 +92,14 @@ class StreamingSpectrogram:
         self.ring.reset()
         self._samples_since_emit = 0
 
+    def push_audio(self, samples: np.ndarray) -> None:
+        samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+
+        if samples.size == 0:
+            return
+
+        self.ring.push(samples)
+
     def push(self, samples: np.ndarray) -> list[np.ndarray]:
         samples = np.asarray(samples, dtype=np.float32).reshape(-1)
 
@@ -116,6 +125,41 @@ class StreamingSpectrogram:
 
     def current_spectrogram(self) -> np.ndarray:
         return get_spectrogram(self.current_audio())
+
+
+class StreamingDecimator:
+    def __init__(
+        self,
+        input_sample_rate: int,
+        output_sample_rate: int,
+    ) -> None:
+        self.input_sample_rate = int(input_sample_rate)
+        self.output_sample_rate = int(output_sample_rate)
+        self._phase = 0
+
+        if self.input_sample_rate <= 0 or self.output_sample_rate <= 0:
+            raise ValueError("Sample rates must be positive")
+
+        if self.input_sample_rate % self.output_sample_rate != 0:
+            raise ValueError("StreamingDecimator requires an integer sample-rate ratio")
+
+        self.factor = self.input_sample_rate // self.output_sample_rate
+
+    def process(self, audio: np.ndarray) -> np.ndarray:
+        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+
+        if audio.size == 0:
+            return audio
+
+        first = (-self._phase) % self.factor
+
+        if first >= audio.size:
+            self._phase = (self._phase + audio.size) % self.factor
+            return np.empty(0, dtype=np.float32)
+
+        out = audio[first::self.factor]
+        self._phase = (self._phase + audio.size) % self.factor
+        return out.astype(np.float32, copy=False)
 
 
 class KeywordSpotter:
@@ -213,7 +257,7 @@ class VoiceNode:
         )
 
         threshold = float(
-            _get_private_param(("threshold", "model/confidence"), 0.95)
+            _get_private_param(("threshold", "model/confidence"), 0.5)
         )
 
         labels = _get_private_param(
@@ -226,7 +270,7 @@ class VoiceNode:
         )
 
         infer_hop_samples = int(
-            _get_private_param(("infer_hop_samples", "model/infer_hop_samples"), EXPECTED_SAMPLES // 2)
+            _get_private_param(("infer_hop_samples", "model/infer_hop_samples"), 1600)
         )
 
         fallback_audio_channels = int(
@@ -243,6 +287,14 @@ class VoiceNode:
 
         audio_channel_index = int(
             _get_private_param(("audio_channel_index", "ros/audio_channel_index"), -1)
+        )
+
+        audio_gain = float(
+            _get_private_param(("audio_gain", "ros/audio_gain"), 10.0)
+        )
+
+        inference_rate = float(
+            _get_private_param(("inference_rate", "model/inference_rate"), 10.0)
         )
 
         audio_topic = _get_private_param(
@@ -278,9 +330,19 @@ class VoiceNode:
         self.fallback_sample_width_bytes = fallback_sample_width_bytes
         self.fallback_input_sample_rate = fallback_input_sample_rate
         self.audio_channel_index = audio_channel_index
+        self.audio_gain = audio_gain
+        self.inference_rate = inference_rate
+        self._decimators = {}
+        self._lock = threading.Lock()
         self._audio_messages = 0
         self._audio_bytes = 0
         self._inference_count = 0
+        self._best_score = 0.0
+        self._best_label = "background"
+        self._recent_best_score = 0.0
+        self._recent_best_label = "background"
+        self._recent_best_started = rospy.Time.now()
+        self._last_inferred_audio_seen = 0
 
         self.publisher = rospy.Publisher(
             command_topic,
@@ -302,7 +364,12 @@ class VoiceNode:
             UInt8MultiArray,
             self.on_audio,
             queue_size=1,
-            buff_size=2**16,
+            buff_size=2**14,
+        )
+
+        self.timer = rospy.Timer(
+            rospy.Duration(1.0 / max(0.1, self.inference_rate)),
+            self.on_inference_timer,
         )
 
         rospy.loginfo("Keyword spotting node started")
@@ -317,6 +384,8 @@ class VoiceNode:
             EXPECTED_SAMPLES,
             self.streamer.emit_hop_samples,
         )
+        rospy.loginfo("Audio gain: %.3f", self.audio_gain)
+        rospy.loginfo("Inference rate: %.3f Hz", self.inference_rate)
 
     def _layout_dim_size(self, msg: UInt8MultiArray, label: str) -> int | None:
         for dim in msg.layout.dim:
@@ -339,15 +408,21 @@ class VoiceNode:
             return audio
 
         if input_sample_rate % SAMPLE_RATE == 0:
-            factor = input_sample_rate // SAMPLE_RATE
+            if input_sample_rate not in self._decimators:
+                self._decimators[input_sample_rate] = StreamingDecimator(
+                    input_sample_rate,
+                    SAMPLE_RATE,
+                )
+
+            decimator = self._decimators[input_sample_rate]
             rospy.loginfo_throttle(
                 5.0,
                 "Downsampled audio from %d Hz to %d Hz by factor %d",
                 input_sample_rate,
                 SAMPLE_RATE,
-                factor,
+                decimator.factor,
             )
-            return audio[::factor]
+            return decimator.process(audio)
 
         duration = audio.size / float(input_sample_rate)
         output_size = max(1, int(round(duration * SAMPLE_RATE)))
@@ -448,6 +523,8 @@ class VoiceNode:
             )
 
         audio /= scale
+        audio *= self.audio_gain
+        audio = np.clip(audio, -1.0, 1.0)
 
         if audio.size:
             peak = float(np.max(np.abs(audio)))
@@ -469,42 +546,86 @@ class VoiceNode:
 
         audio = self._resample_to_model_rate(audio, input_sample_rate)
 
-        for spectrogram in self.streamer.push(audio):
-            result = self.spotter.predict_spectrogram(spectrogram)
+        with self._lock:
+            self.streamer.push_audio(audio)
 
-            score = float(result["score"])
-            label = str(result["label"])
-            self._inference_count += 1
+    def on_inference_timer(self, _event) -> None:
+        with self._lock:
+            if not self.streamer.ready:
+                return
 
-            if self.inference_publisher is not None:
-                inference = VoiceCommand()
-                inference.command = label
-                inference.confidence = score
-                self.inference_publisher.publish(inference)
+            samples_seen = self.streamer.ring.samples_seen()
+            new_samples = samples_seen - self._last_inferred_audio_seen
 
-            rospy.loginfo_throttle(
-                2.0,
-                "Inference alive: count=%d, label=%s, score=%.3f, threshold=%.3f",
-                self._inference_count,
-                label,
-                score,
-                self.spotter.threshold,
-            )
+            if new_samples < self.streamer.emit_hop_samples:
+                rospy.loginfo_throttle(
+                    2.0,
+                    "Inference waiting: buffered=%d/%d, new_samples=%d/%d",
+                    min(samples_seen, EXPECTED_SAMPLES),
+                    EXPECTED_SAMPLES,
+                    new_samples,
+                    self.streamer.emit_hop_samples,
+                )
+                return
 
-            if score < self.spotter.threshold:
-                continue
+            self._last_inferred_audio_seen = samples_seen
+            audio = self.streamer.current_audio()
 
-            command = VoiceCommand()
-            command.command = label
-            command.confidence = score
+        spectrogram = get_spectrogram(audio)
+        result = self.spotter.predict_spectrogram(spectrogram)
 
-            self.publisher.publish(command)
+        score = float(result["score"])
+        label = str(result["label"])
+        self._inference_count += 1
 
-            rospy.loginfo(
-                "Detected: %s (%.3f)",
-                command.command,
-                command.confidence,
-            )
+        if score >= self._best_score:
+            self._best_score = score
+            self._best_label = label
+
+        now = rospy.Time.now()
+
+        if (now - self._recent_best_started).to_sec() >= 5.0:
+            self._recent_best_score = 0.0
+            self._recent_best_label = "background"
+            self._recent_best_started = now
+
+        if score >= self._recent_best_score:
+            self._recent_best_score = score
+            self._recent_best_label = label
+
+        if self.inference_publisher is not None:
+            inference = VoiceCommand()
+            inference.command = label
+            inference.confidence = score
+            self.inference_publisher.publish(inference)
+
+        rospy.loginfo_throttle(
+            2.0,
+            "Inference alive: count=%d, label=%s, score=%.3f, recent_best_label=%s, recent_best_score=%.3f, all_time_best_label=%s, all_time_best_score=%.3f, threshold=%.3f",
+            self._inference_count,
+            label,
+            score,
+            self._recent_best_label,
+            self._recent_best_score,
+            self._best_label,
+            self._best_score,
+            self.spotter.threshold,
+        )
+
+        if score < self.spotter.threshold:
+            return
+
+        command = VoiceCommand()
+        command.command = label
+        command.confidence = score
+
+        self.publisher.publish(command)
+
+        rospy.loginfo(
+            "Detected: %s (%.3f)",
+            command.command,
+            command.confidence,
+        )
 
 
 def main() -> None:

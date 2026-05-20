@@ -2,7 +2,8 @@ model:
   path: "keyword_spotting/weights/checkpoint.tflite"
   confidence: 0.95
   labels: ["background", "marvin"]
-  infer_hop_samples: 8000
+  infer_hop_samples: 3200
+  inference_rate: 5.0
 ros:
   publish_topic: "/voice/command"
   inference_topic: "/voice/inference"
@@ -11,4 +12,5 @@ ros:
   input_sample_rate: 48000
   audio_channels: 2
   sample_width_bytes: 4
-  audio_channel_index: 0
+  audio_channel_index: -1
+  audio_gain: 1.0

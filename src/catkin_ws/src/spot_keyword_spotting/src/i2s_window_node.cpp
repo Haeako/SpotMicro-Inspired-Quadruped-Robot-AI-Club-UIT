@@ -182,8 +182,13 @@ private:
       return;
     }
 
-    ROS_WARN_THROTTLE(2.0, "ALSA read failed: %s", alsa_.strerror(static_cast<int>(frames)));
-    alsa_.prepare(pcm_);
+    ++read_errors_;
+    ROS_WARN_THROTTLE(2.0, "ALSA read failed: %s (code=%ld, count=%d); reopening capture stream", alsa_.strerror(static_cast<int>(frames)), frames, read_errors_);
+    try {
+      openPcm();
+    } catch (const std::exception &exc) {
+      ROS_WARN_THROTTLE(2.0, "Failed to reopen ALSA capture stream: %s", exc.what());
+    }
   }
 
   void processBlock(const uint8_t *data, size_t frames) {
@@ -298,6 +303,7 @@ private:
   int decimation_count_ = 0;
   int bytes_per_sample_ = 4;
   int overruns_ = 0;
+  int read_errors_ = 0;
   double audio_gain_ = 1.0;
   float scale_ = 2147483648.0f;
   float decimation_accum_ = 0.0f;

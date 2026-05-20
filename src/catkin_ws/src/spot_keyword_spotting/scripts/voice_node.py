@@ -259,7 +259,7 @@ class VoiceNode:
         )
 
         threshold = float(
-            _get_private_param(("threshold", "model/confidence"), 0.5)
+            _get_private_param(("threshold", "model/confidence"), 0.95)
         )
 
         labels = _get_private_param(
@@ -319,7 +319,7 @@ class VoiceNode:
         )
 
         save_detected_chunks = bool(
-            _get_private_param(("save_detected_chunks", "debug/save_detected_chunks"), False)
+            _get_private_param(("save_detected_chunks", "debug/save_detected_chunks"), True)
         )
 
         detected_chunk_dir = _resolve_package_path(

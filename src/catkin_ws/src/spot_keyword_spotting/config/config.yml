@@ -12,6 +12,7 @@ ros:
   input_sample_rate: 48000
   audio_channels: 2
   sample_width_bytes: 4
+  s32_shift_bits: 0
   audio_channel_index: -1
   audio_gain: 1.0
 debug:

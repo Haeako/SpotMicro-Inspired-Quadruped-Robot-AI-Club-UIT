@@ -287,6 +287,10 @@ class VoiceNode:
             _get_private_param(("input_sample_rate", "ros/input_sample_rate"), SAMPLE_RATE)
         )
 
+        s32_shift_bits = int(
+            _get_private_param(("s32_shift_bits", "ros/s32_shift_bits"), 0)
+        )
+
         audio_channel_index = int(
             _get_private_param(("audio_channel_index", "ros/audio_channel_index"), -1)
         )
@@ -353,6 +357,7 @@ class VoiceNode:
         self.fallback_audio_channels = max(1, fallback_audio_channels)
         self.fallback_sample_width_bytes = fallback_sample_width_bytes
         self.fallback_input_sample_rate = fallback_input_sample_rate
+        self.s32_shift_bits = s32_shift_bits
         self.audio_channel_index = audio_channel_index
         self.audio_gain = audio_gain
         self.inference_rate = inference_rate
@@ -424,6 +429,7 @@ class VoiceNode:
             self.streamer.emit_hop_samples,
         )
         rospy.loginfo("Audio gain: %.3f", self.audio_gain)
+        rospy.loginfo("S32 shift bits: %d", self.s32_shift_bits)
         rospy.loginfo("Inference rate: %.3f Hz", self.inference_rate)
         if self.save_detected_chunks:
             rospy.loginfo("Saving detected chunks to: %s", self.detected_chunk_dir)
@@ -537,7 +543,12 @@ class VoiceNode:
                 SAMPLE_RATE,
                 decimator.factor,
             )
-            return decimator.process(audio)
+            # Use block averaging for integer-ratio downsampling. Plain decimation
+            # aliases high-frequency I2S noise into the speech band.
+            usable = audio.size - (audio.size % decimator.factor)
+            if usable <= 0:
+                return decimator.process(audio)
+            return audio[:usable].reshape(-1, decimator.factor).mean(axis=1).astype(np.float32)
 
         duration = audio.size / float(input_sample_rate)
         output_size = max(1, int(round(duration * SAMPLE_RATE)))
@@ -603,7 +614,13 @@ class VoiceNode:
             )
             raw = raw[: raw.size - (raw.size % sample_width_bytes)]
 
-        audio = raw.view(dtype).astype(np.float32)
+        audio = raw.view(dtype)
+
+        if sample_width_bytes == 4 and self.s32_shift_bits > 0:
+            audio = (audio >> self.s32_shift_bits).astype(np.float32)
+            scale = float(1 << max(1, 31 - self.s32_shift_bits))
+        else:
+            audio = audio.astype(np.float32)
 
         channels = self._layout_dim_size(msg, "channels")
 

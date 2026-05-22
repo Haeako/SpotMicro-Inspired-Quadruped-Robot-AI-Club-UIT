@@ -157,6 +157,7 @@ class SpotMicroMotionCmd
   ros::NodeHandle nh_; // Defining the ros NodeHandle variable for registrating the same with the master
   ros::NodeHandle pnh_; // Private version of node handle
   ros::Subscriber stand_sub_; // ros subscriber handle for stand_cmd topic
+  ros::Subscriber voice_sub_; // ros subscriber handle for stand_cmd topic
   ros::Subscriber idle_sub_; // ros subscriber handle for idle_cmd topic
   ros::Subscriber walk_sub_;
   ros::Subscriber vel_cmd_sub_;

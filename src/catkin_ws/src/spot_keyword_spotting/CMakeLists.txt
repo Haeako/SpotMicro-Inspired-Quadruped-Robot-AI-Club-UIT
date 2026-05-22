@@ -11,12 +11,8 @@ find_package(catkin REQUIRED COMPONENTS
   std_msgs
 )
 
-find_package(pybind11 REQUIRED)
+find_package(pybind11 REQUIRED) 
 
-add_message_files(
-  FILES
-  VoiceCommand.msg
-)
 
 generate_messages(
   DEPENDENCIES

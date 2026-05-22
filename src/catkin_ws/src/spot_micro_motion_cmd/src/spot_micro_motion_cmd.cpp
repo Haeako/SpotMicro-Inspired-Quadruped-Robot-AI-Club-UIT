@@ -74,7 +74,10 @@ SpotMicroMotionCmd::SpotMicroMotionCmd(ros::NodeHandle &nh, ros::NodeHandle &pnh
   // Initialize publishers and subscribers
   // stand cmd event subscriber 
   stand_sub_ = nh.subscribe("/stand_cmd", 1, &SpotMicroMotionCmd::standCommandCallback, this);
-    
+  
+  // voice cmd event subscriber 
+  voice_sub_ = nh.subscribe("/voice_cmd", 1, &SpotMicroMotionCmd::standCommandCallback, this);
+      
   // idle cmd event subscriber
   idle_sub_ = nh.subscribe("/idle_cmd", 1, &SpotMicroMotionCmd::idleCommandCallback, this);
 

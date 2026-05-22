@@ -14,7 +14,7 @@ import numpy as np
 import rospy
 import rospkg
 
-from spot_keyword_spotting.msg import VoiceCommand
+from std_msgs.msg import Bool
 
 try:
     import kws_native
@@ -230,7 +230,7 @@ class I2SVoiceNode:
         )
         self.streamer = StreamingSpectrogram(emit_hop_samples=self.infer_hop_samples)
         self.resampler = RatioAveragingResampler(self.input_sample_rate, SAMPLE_RATE)
-        self.publisher = rospy.Publisher("/voice/command", VoiceCommand, queue_size=10)
+        self.publisher = rospy.Publisher("/voice_cmd", Bool, queue_size=10)
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -437,12 +437,7 @@ class I2SVoiceNode:
 
         if score < self.spotter.threshold:
             return
-
-        command = VoiceCommand()
-        command.command = label
-        command.confidence = score
-        self.publisher.publish(command)
-        self._save_detected_chunk(audio, label, score)
+        self.publisher.publish(True)
         rospy.loginfo("Detected: %s (%.3f)", label, score)
 
     def shutdown(self) -> None:

@@ -1,9 +1,9 @@
 model:
   path: "keyword_spotting/weights/checkpoint.tflite"
-  confidence: 0.95
+  confidence: 0.5
   labels: ["background", "marvin"]
   infer_hop_samples: 3200
-  inference_rate: 5.0
+  inference_rate: 1.0
 ros:
   publish_topic: "/voice/command"
   inference_topic: "/voice/inference"
@@ -15,7 +15,7 @@ ros:
   sample_width_bytes: 4
   s32_shift_bits: 0
   audio_channel_index: -1
-  audio_gain: 1.0
+  audio_gain: 5.0
 debug:
   save_detected_chunks: true
   detected_chunk_dir: "detected_chunks"

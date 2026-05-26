@@ -6,3 +6,4 @@ src/catkin_ws/log.log
 src/catkin_ws/src/spot_keyword_spotting/scripts/__pycache__/
 src/catkin_ws/src/ros_i2s_mic/src/__pycache__/
 *.wav
+src/other_scirpts/keyword_spotting/__pycache__/

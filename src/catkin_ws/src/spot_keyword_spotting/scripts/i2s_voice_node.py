@@ -11,6 +11,7 @@ from pathlib import Path
 
 import alsaaudio
 import numpy as np
+import roslaunch
 import rospy
 import rospkg
 
@@ -209,6 +210,12 @@ class I2SVoiceNode:
         self.threshold = float(_get_private_param(("confidence", "model/confidence"), 0.95))
         self.labels = tuple(_get_private_param(("labels", "model/labels"), DEFAULT_LABELS))
         self.num_threads = int(_get_private_param(("num_threads", "model/num_threads"), 1))        
+        self.launch_on_detect = bool(_get_private_param(("launch_on_detect", "launch/enabled"), True))
+        self.launch_once = bool(_get_private_param(("launch_once", "launch/once"), True))
+        self.launch_cooldown = float(_get_private_param(("launch_cooldown", "launch/cooldown"), 10.0))
+        self.launch_target_label = str(_get_private_param(("launch_target_label", "launch/target_label"), "marvin"))
+        self.launch_package = str(_get_private_param(("launch_package", "launch/package"), "spot_micro_joy"))
+        self.launch_file = str(_get_private_param(("launch_file", "launch/file"), "everything.launch"))
         self.save_detected_chunks = bool(_get_private_param(("save_detected_chunks", "debug/save_detected_chunks"), False))
         self.detected_chunk_dir = _resolve_package_path(
             package_root,
@@ -245,6 +252,9 @@ class I2SVoiceNode:
         self.best_label = "background"
         self.last_inferred_audio_seen = 0
         self.saved_detected_chunks = 0
+        self.launch_parent = None
+        self.launch_started = False
+        self.last_launch_time = 0.0
 
         if self.save_detected_chunks:
             self.detected_chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -275,7 +285,14 @@ class I2SVoiceNode:
             self.inference_rate,
         )
         rospy.loginfo("Audio gain: %.3f, save detected chunks: %s", self.audio_gain, self.save_detected_chunks)
-        rospy.loginfo("Publishing command topic only: %s", self.publisher.name)
+        rospy.loginfo(
+            "Publishing command topic: %s, launch_on_detect=%s target_label=%s launch=%s/%s",
+            self.publisher.name,
+            self.launch_on_detect,
+            self.launch_target_label,
+            self.launch_package,
+            self.launch_file,
+        )
 
     def _open_pcm(self) -> None:
         self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device=self.device)
@@ -316,6 +333,32 @@ class I2SVoiceNode:
         )
         self._write_wav(path, audio, SAMPLE_RATE)
         rospy.loginfo("Saved detected chunk: %s", path)
+
+    def _launch_everything(self) -> None:
+        if not self.launch_on_detect:
+            return
+        if self.launch_once and self.launch_started:
+            rospy.loginfo_throttle(5.0, "Launch already started; ignoring repeated detection.")
+            return
+
+        now = time.time()
+        if now - self.last_launch_time < self.launch_cooldown:
+            rospy.loginfo_throttle(2.0, "Launch trigger is cooling down.")
+            return
+
+        launch_path = Path(rospkg.RosPack().get_path(self.launch_package)) / "launch" / self.launch_file
+        if not launch_path.exists():
+            rospy.logerr("Launch file not found: %s", launch_path)
+            self.last_launch_time = now
+            return
+
+        uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
+        roslaunch.configure_logging(uuid)
+        self.launch_parent = roslaunch.parent.ROSLaunchParent(uuid, [str(launch_path)])
+        self.launch_parent.start()
+        self.launch_started = True
+        self.last_launch_time = now
+        rospy.loginfo("Started launch file after voice detection: %s", launch_path)
 
     def _read_mono(self) -> np.ndarray | None:
         try:
@@ -439,9 +482,17 @@ class I2SVoiceNode:
             return
         self.publisher.publish(True)
         rospy.loginfo("Detected: %s (%.3f)", label, score)
+        self._save_detected_chunk(audio, label, score)
+        if label == self.launch_target_label:
+            self._launch_everything()
 
     def shutdown(self) -> None:
         self._stop_event.set()
+        if self.launch_parent is not None:
+            try:
+                self.launch_parent.shutdown()
+            except Exception as exc:
+                rospy.logwarn("Failed to shutdown launched processes cleanly: %s", exc)
         try:
             if self.pcm is not None:
                 self.pcm.close()

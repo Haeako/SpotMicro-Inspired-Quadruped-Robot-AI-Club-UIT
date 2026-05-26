@@ -41,6 +41,8 @@ set_target_properties(kws_native PROPERTIES
 
 catkin_install_python(PROGRAMS
   scripts/i2s_voice_node.py
+  scripts/i2s_raw_audio_publisher.py
+  scripts/raw_audio_subscriber.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

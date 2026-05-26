@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert the keyword spotting ONNX model to a full UINT8 TFLite model."""
+"""Convert the keyword spotting ONNX model to a full INT8 TFLite model."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ WEIGHTS_DIR = ROOT / "src" / "catkin_ws" / "src" / "spot_keyword_spotting" / "ke
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Convert ONNX keyword model to UINT8 TFLite.")
+    parser = argparse.ArgumentParser(description="Convert ONNX keyword model to INT8 TFLite.")
     parser.add_argument(
         "--onnx",
         type=Path,
@@ -26,8 +26,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--out",
         type=Path,
-        default=WEIGHTS_DIR / "checkpoint_uint8.tflite",
-        help="Output UINT8 TFLite model path.",
+        default=WEIGHTS_DIR / "checkpoint_int8.tflite",
+        help="Output INT8 TFLite model path.",
     )
     parser.add_argument(
         "--saved-model-dir",
@@ -86,7 +86,7 @@ def representative_dataset(data: np.ndarray, batch_size: int) -> Iterable[list[n
         yield [data[start : start + batch_size].astype(np.float32)]
 
 
-def convert_saved_model_to_uint8_tflite(
+def convert_saved_model_to_int8_tflite(
     saved_model_dir: Path,
     output_path: Path,
     calibration_data: np.ndarray,
@@ -96,8 +96,8 @@ def convert_saved_model_to_uint8_tflite(
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = lambda: representative_dataset(calibration_data, batch_size)
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-    converter.inference_input_type = tf.uint8
-    converter.inference_output_type = tf.uint8
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(converter.convert())
@@ -110,13 +110,13 @@ def main() -> None:
 
     calibration_data = load_representative_data(args.representative_data)
     convert_onnx_to_saved_model(args.onnx, args.saved_model_dir)
-    convert_saved_model_to_uint8_tflite(
+    convert_saved_model_to_int8_tflite(
         args.saved_model_dir,
         args.out,
         calibration_data,
         args.batch_size,
     )
-    print(f"Saved UINT8 TFLite model: {args.out}")
+    print(f"Saved INT8 TFLite model: {args.out}")
 
 
 if __name__ == "__main__":

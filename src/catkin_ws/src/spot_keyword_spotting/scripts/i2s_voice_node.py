@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import subprocess
 import threading
 import time
 import wave
@@ -11,7 +12,6 @@ from pathlib import Path
 
 import alsaaudio
 import numpy as np
-import roslaunch
 import rospy
 import rospkg
 
@@ -216,6 +216,7 @@ class I2SVoiceNode:
         self.launch_target_label = str(_get_private_param(("launch_target_label", "launch/target_label"), "marvin"))
         self.launch_package = str(_get_private_param(("launch_package", "launch/package"), "spot_micro_joy"))
         self.launch_file = str(_get_private_param(("launch_file", "launch/file"), "everything.launch"))
+        self.shutdown_after_launch = bool(_get_private_param(("shutdown_after_launch", "launch/shutdown_after_launch"), True))
         self.save_detected_chunks = bool(_get_private_param(("save_detected_chunks", "debug/save_detected_chunks"), False))
         self.detected_chunk_dir = _resolve_package_path(
             package_root,
@@ -253,6 +254,7 @@ class I2SVoiceNode:
         self.last_inferred_audio_seen = 0
         self.saved_detected_chunks = 0
         self.launch_parent = None
+        self.launch_process = None
         self.launch_started = False
         self.last_launch_time = 0.0
 
@@ -352,13 +354,13 @@ class I2SVoiceNode:
             self.last_launch_time = now
             return
 
-        uuid = roslaunch.rlutil.get_or_generate_uuid(None, False)
-        roslaunch.configure_logging(uuid)
-        self.launch_parent = roslaunch.parent.ROSLaunchParent(uuid, [str(launch_path)])
-        self.launch_parent.start()
+        self.launch_process = subprocess.Popen(["roslaunch", self.launch_package, self.launch_file])
         self.launch_started = True
         self.last_launch_time = now
         rospy.loginfo("Started launch file after voice detection: %s", launch_path)
+        if self.shutdown_after_launch:
+            rospy.loginfo("Keyword spotting finished; shutting this node down to save resources.")
+            rospy.signal_shutdown("voice command detected and launch started")
 
     def _read_mono(self) -> np.ndarray | None:
         try:
@@ -493,6 +495,11 @@ class I2SVoiceNode:
                 self.launch_parent.shutdown()
             except Exception as exc:
                 rospy.logwarn("Failed to shutdown launched processes cleanly: %s", exc)
+        if self.launch_process is not None and not self.shutdown_after_launch:
+            try:
+                self.launch_process.terminate()
+            except OSError as exc:
+                rospy.logwarn("Failed to terminate launched roslaunch process cleanly: %s", exc)
         try:
             if self.pcm is not None:
                 self.pcm.close()

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<launch>
+    <arg name="device" default="hw:1,0"/>
+    <arg name="confidence" default="0.5"/>
+    <arg name="audio_gain" default="5.0"/>
+    <arg name="target_label" default="marvin"/>
+
+    <node name="spot_keyword_spotting"
+          pkg="spot_keyword_spotting"
+          type="i2s_voice_node.py"
+          output="screen">
+        <param name="device" value="$(arg device)"/>
+        <param name="confidence" value="$(arg confidence)"/>
+        <param name="audio_gain" value="$(arg audio_gain)"/>
+
+        <param name="launch_on_detect" value="true"/>
+        <param name="launch_once" value="true"/>
+        <param name="launch_target_label" value="$(arg target_label)"/>
+        <param name="launch_package" value="spot_micro_joy"/>
+        <param name="launch_file" value="everything.launch"/>
+        <param name="shutdown_after_launch" value="true"/>
+    </node>
+</launch>

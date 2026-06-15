@@ -38,6 +38,8 @@ class SpotMicroJoystickControl():
 
     def __init__(self):
 
+        self.mode = self.MODE_IDLE
+
         self._angle_cmd_msg = Vector3()
         self._angle_cmd_msg.x = 0
         self._angle_cmd_msg.y = 0

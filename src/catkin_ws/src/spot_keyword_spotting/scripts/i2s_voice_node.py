@@ -4,10 +4,8 @@
 from __future__ import annotations
 
 import errno
-import subprocess
 import threading
 import time
-import wave
 from pathlib import Path
 
 import alsaaudio
@@ -15,7 +13,7 @@ import numpy as np
 import rospy
 import rospkg
 
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 try:
     import kws_native
@@ -30,23 +28,9 @@ EXPECTED_SAMPLES = int(kws_native.EXPECTED_SAMPLES)
 DEFAULT_LABELS = ("background", "marvin")
 
 
-def _get_private_param(names, default):
-    if isinstance(names, str):
-        names = (names,)
-
-    for name in names:
-        private_name = name if name.startswith("~") else "~" + name
-        if rospy.has_param(private_name):
-            return rospy.get_param(private_name)
-
-    return default
-
-
-def _resolve_package_path(package_root: Path, value: str | Path) -> Path:
-    path = Path(value)
-    if path.is_absolute():
-        return path
-    return package_root / path
+def _get_private_param(name, default):
+    private_name = name if name.startswith("~") else "~" + name
+    return rospy.get_param(private_name, default)
 
 
 def _load_tflite_interpreter():
@@ -101,17 +85,13 @@ class RatioAveragingResampler:
             raise ValueError("RatioAveragingResampler requires an integer sample-rate ratio")
         self.factor = self.input_sample_rate // self.output_sample_rate
         self._pending = np.empty(0, dtype=np.float32)
-        self._input_count = 0
-        self._output_count = 0
 
     def process(self, audio: np.ndarray) -> np.ndarray:
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
         if audio.size == 0:
             return np.empty(0, dtype=np.float32)
 
-        self._input_count += int(audio.size)
         if self.factor == 1:
-            self._output_count += int(audio.size)
             return audio.astype(np.float32, copy=False)
 
         if self._pending.size:
@@ -122,21 +102,7 @@ class RatioAveragingResampler:
         if usable <= 0:
             return np.empty(0, dtype=np.float32)
 
-        out = audio[:usable].reshape(-1, self.factor).mean(axis=1).astype(np.float32)
-        self._output_count += int(out.size)
-        return out
-
-    @property
-    def pending_samples(self) -> int:
-        return int(self._pending.size)
-
-    @property
-    def input_count(self) -> int:
-        return int(self._input_count)
-
-    @property
-    def output_count(self) -> int:
-        return int(self._output_count)
+        return audio[:usable].reshape(-1, self.factor).mean(axis=1).astype(np.float32)
 
 
 class KeywordSpotter:
@@ -187,77 +153,66 @@ class KeywordSpotter:
 
 
 SAMPLE_FORMATS = {
-    "S16_LE": (alsaaudio.PCM_FORMAT_S16_LE, 2, np.dtype("<i2"), 32768.0),
-    "S32_LE": (alsaaudio.PCM_FORMAT_S32_LE, 4, np.dtype("<i4"), 2147483648.0),
+    "S16_LE": (alsaaudio.PCM_FORMAT_S16_LE, np.dtype("<i2"), 32768.0),
+    "S32_LE": (alsaaudio.PCM_FORMAT_S32_LE, np.dtype("<i4"), 2147483648.0),
 }
-
-# hw:1,0 only accepts period_size=128; anything larger puts the
-# device into a bad state ("File descriptor in bad state").
-MAX_SAFE_PERIOD = 128
 
 
 class I2SVoiceNode:
+    INPUT_SAMPLE_RATE = 48000
+    CHANNELS = 2
+    PERIOD_SIZE = 128
+    SAMPLE_FORMAT = "S32_LE"
+    CHANNEL_INDEX = 0
+    INFERENCE_RATE = 2.0
+    INFER_HOP_SAMPLES = EXPECTED_SAMPLES // 5
+    NUM_THREADS = 1
+    ACTIVE_STATE = "Idle"
+    STATE_TOPIC = "/lcd_state"
+    STAND_CMD_TOPIC = "/stand_cmd"
+    COMMAND_COOLDOWN = 2.0
+
     def __init__(self) -> None:
         package_root = Path(rospkg.RosPack().get_path("spot_keyword_spotting"))
         default_model = package_root / "keyword_spotting" / "weights" / "model_int8.tflite"
 
-        self.device = _get_private_param(("device", "i2s/device"), "hw:1,0")
-        self.input_sample_rate = int(_get_private_param(("input_sample_rate", "i2s/sample_rate", "ros/input_sample_rate"), 48000))
-        self.channels = int(_get_private_param(("channels", "i2s/channels", "ros/audio_channels"), 2))
-        # FIX 1: default period_size=128 (hardware cap for this I2S device).
-        self.period_size = int(_get_private_param(("period_size", "i2s/period_size"), 128))
-        self.sample_format = str(_get_private_param(("sample_format", "i2s/sample_format"), "S32_LE")).upper()
-        self.channel_index = int(_get_private_param(("channel_index", "i2s/channel_index", "ros/audio_channel_index"), 0))
-        self.audio_gain = float(_get_private_param(("audio_gain", "ros/audio_gain"), 1.0))
-        self.capture_stats = bool(_get_private_param(("capture_stats", "debug/capture_stats"), False))
-        self.resampler_stats = bool(_get_private_param(("resampler_stats", "debug/resampler_stats"), False))
-        self.infer_hop_samples = int(_get_private_param(("infer_hop_samples", "model/infer_hop_samples"), EXPECTED_SAMPLES // 5))
-        self.inference_rate = float(_get_private_param(("inference_rate", "model/inference_rate"), 2.0))
-        self.threshold = float(_get_private_param(("confidence", "model/confidence"), 0.95))
-        self.labels = tuple(_get_private_param(("labels", "model/labels"), DEFAULT_LABELS))
-        self.num_threads = int(_get_private_param(("num_threads", "model/num_threads"), 1))
-        self.launch_on_detect = bool(_get_private_param(("launch_on_detect", "launch/enabled"), True))
-        self.launch_once = bool(_get_private_param(("launch_once", "launch/once"), True))
-        self.launch_cooldown = float(_get_private_param(("launch_cooldown", "launch/cooldown"), 10.0))
-        self.launch_target_label = str(_get_private_param(("launch_target_label", "launch/target_label"), "marvin"))
-        self.launch_package = str(_get_private_param(("launch_package", "launch/package"), "spot_micro_joy"))
-        self.launch_file = str(_get_private_param(("launch_file", "launch/file"), "everything.launch"))
-        self.shutdown_after_launch = bool(_get_private_param(("shutdown_after_launch", "launch/shutdown_after_launch"), True))
-        self.save_detected_chunks = bool(_get_private_param(("save_detected_chunks", "debug/save_detected_chunks"), False))
-        self.detected_chunk_dir = _resolve_package_path(
-            package_root,
-            _get_private_param(("detected_chunk_dir", "debug/detected_chunk_dir"), "detected_chunks"),
-        )
+        self.device = _get_private_param("device", "hw:1,0")
+        self.audio_gain = float(_get_private_param("audio_gain", 5.0))
+        self.threshold = float(_get_private_param("confidence", 0.7))
+        self.target_label = str(_get_private_param("target_label", DEFAULT_LABELS[1]))
 
-        # FIX 1 (cont.): clamp period_size so a misconfigured param cannot
-        # put the device into a bad state.
-        if self.period_size > MAX_SAFE_PERIOD:
-            rospy.logwarn(
-                "period_size=%d exceeds hardware cap %d; clamping.",
-                self.period_size, MAX_SAFE_PERIOD,
-            )
-            self.period_size = MAX_SAFE_PERIOD
+        self.input_sample_rate = self.INPUT_SAMPLE_RATE
+        self.channels = self.CHANNELS
+        self.period_size = self.PERIOD_SIZE
+        self.sample_format = self.SAMPLE_FORMAT
+        self.channel_index = self.CHANNEL_INDEX
+        self.infer_hop_samples = self.INFER_HOP_SAMPLES
+        self.inference_rate = self.INFERENCE_RATE
 
         if self.sample_format not in SAMPLE_FORMATS:
             supported = ", ".join(sorted(SAMPLE_FORMATS))
             raise ValueError("Unsupported sample_format '{}'. Supported values: {}".format(self.sample_format, supported))
 
-        self.alsa_format, self.bytes_per_sample, self.dtype, self.scale = SAMPLE_FORMATS[self.sample_format]
-        model_path = _resolve_package_path(package_root, _get_private_param(("model_path", "model/path"), str(default_model)))
+        self.alsa_format, self.dtype, self.scale = SAMPLE_FORMATS[self.sample_format]
+        model_path = default_model
 
         self.spotter = KeywordSpotter(
             model_path=model_path,
-            labels=self.labels,
+            labels=DEFAULT_LABELS,
             threshold=self.threshold,
-            num_threads=self.num_threads,
+            num_threads=self.NUM_THREADS,
         )
         self.streamer = StreamingSpectrogram(emit_hop_samples=self.infer_hop_samples)
         self.resampler = RatioAveragingResampler(self.input_sample_rate, SAMPLE_RATE)
-        self.publisher = rospy.Publisher("/voice_cmd", Bool, queue_size=10)
+        self.stand_publisher = rospy.Publisher(self.STAND_CMD_TOPIC, Bool, queue_size=1)
+        self.state_subscriber = rospy.Subscriber(self.STATE_TOPIC, String, self.on_state, queue_size=1)
 
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self.pcm = None
+        self.current_state = self.ACTIVE_STATE
+        self.inference_enabled = True
+        self.waiting_for_state_exit = False
         self.fixed_channel = self.channel_index if 0 <= self.channel_index < self.channels else None
         self.audio_messages = 0
         self.audio_bytes = 0
@@ -267,14 +222,7 @@ class I2SVoiceNode:
         self.best_score = 0.0
         self.best_label = "background"
         self.last_inferred_audio_seen = 0
-        self.saved_detected_chunks = 0
-        self.launch_parent = None
-        self.launch_process = None
-        self.launch_started = False
-        self.last_launch_time = 0.0
-
-        if self.save_detected_chunks:
-            self.detected_chunk_dir.mkdir(parents=True, exist_ok=True)
+        self.last_command_time = 0.0
 
         self._open_pcm()
         self.capture_thread = threading.Thread(target=self._capture_loop, name="i2s_capture", daemon=True)
@@ -285,7 +233,7 @@ class I2SVoiceNode:
         )
 
         rospy.loginfo(
-            "Direct I2S KWS started: device=%s, rate=%d, channels=%d, format=%s, period=%d, channel_index=%d",
+            "I2S voice node started: device=%s, rate=%d, channels=%d, format=%s, period=%d, channel_index=%d",
             self.device,
             self.input_sample_rate,
             self.channels,
@@ -295,21 +243,33 @@ class I2SVoiceNode:
         )
         rospy.loginfo("Model path: %s", model_path)
         rospy.loginfo(
-            "Threshold: %.3f, expected samples: %d, inference hop samples: %d, inference rate: %.3f Hz",
+            "Wake flow: target_label=%s threshold=%.3f audio_gain=%.3f active_state=%s stand_topic=%s",
+            self.target_label,
             self.threshold,
-            EXPECTED_SAMPLES,
-            self.infer_hop_samples,
-            self.inference_rate,
+            self.audio_gain,
+            self.ACTIVE_STATE,
+            self.STAND_CMD_TOPIC,
         )
-        rospy.loginfo("Audio gain: %.3f, save detected chunks: %s", self.audio_gain, self.save_detected_chunks)
-        rospy.loginfo(
-            "Publishing command topic: %s, launch_on_detect=%s target_label=%s launch=%s/%s",
-            self.publisher.name,
-            self.launch_on_detect,
-            self.launch_target_label,
-            self.launch_package,
-            self.launch_file,
-        )
+
+    def on_state(self, msg: String) -> None:
+        state = msg.data.strip()
+        if self.waiting_for_state_exit and state == self.ACTIVE_STATE:
+            self.current_state = state
+            self.inference_enabled = False
+            return
+
+        if self.waiting_for_state_exit and state != self.ACTIVE_STATE:
+            self.waiting_for_state_exit = False
+
+        enabled = state == self.ACTIVE_STATE
+        if enabled != self.inference_enabled:
+            rospy.loginfo(
+                "Voice inference %s because robot state is %s",
+                "enabled" if enabled else "paused",
+                state,
+            )
+        self.current_state = state
+        self.inference_enabled = enabled
 
     # FIX 2: PCM_NONBLOCK — at period_size=128 (2.67 ms) the capture thread
     # must service reads extremely fast.  Blocking mode stalls on any hiccup
@@ -341,55 +301,18 @@ class I2SVoiceNode:
         self._close_pcm_safe()
         self._open_pcm()
 
-    def _write_wav(self, path: Path, audio: np.ndarray, sample_rate: int) -> None:
-        audio = np.asarray(audio, dtype=np.float32).reshape(-1)
-        audio = np.clip(audio, -1.0, 1.0)
-        pcm = (audio * 32767.0).astype("<i2")
-        with wave.open(str(path), "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(int(sample_rate))
-            wav.writeframes(pcm.tobytes())
-
-    def _save_detected_chunk(self, audio: np.ndarray, label: str, score: float) -> None:
-        if not self.save_detected_chunks:
-            return
-
-        self.saved_detected_chunks += 1
-        path = self.detected_chunk_dir / "{stamp}_{idx:04d}_{label}_{score:.3f}.wav".format(
-            stamp=time.strftime("%Y%m%d_%H%M%S"),
-            idx=self.saved_detected_chunks,
-            label=label,
-            score=score,
-        )
-        self._write_wav(path, audio, SAMPLE_RATE)
-        rospy.loginfo("Saved detected chunk: %s", path)
-
-    def _launch_everything(self) -> None:
-        if not self.launch_on_detect:
-            return
-        if self.launch_once and self.launch_started:
-            rospy.loginfo_throttle(5.0, "Launch already started; ignoring repeated detection.")
-            return
-
+    def _publish_stand_command(self) -> None:
         now = time.time()
-        if now - self.last_launch_time < self.launch_cooldown:
-            rospy.loginfo_throttle(2.0, "Launch trigger is cooling down.")
+        if now - self.last_command_time < self.COMMAND_COOLDOWN:
+            rospy.loginfo_throttle(2.0, "Voice stand command is cooling down.")
             return
 
-        launch_path = Path(rospkg.RosPack().get_path(self.launch_package)) / "launch" / self.launch_file
-        if not launch_path.exists():
-            rospy.logerr("Launch file not found: %s", launch_path)
-            self.last_launch_time = now
-            return
-
-        self.launch_process = subprocess.Popen(["roslaunch", self.launch_package, self.launch_file])
-        self.launch_started = True
-        self.last_launch_time = now
-        rospy.loginfo("Started launch file after voice detection: %s", launch_path)
-        if self.shutdown_after_launch:
-            rospy.loginfo("Keyword spotting finished; shutting this node down to save resources.")
-            rospy.signal_shutdown("voice command detected and launch started")
+        self.stand_publisher.publish(Bool(data=True))
+        self.last_command_time = now
+        self.inference_enabled = False
+        self.waiting_for_state_exit = True
+        self.current_state = "Voice Stand Commanded"
+        rospy.loginfo("Voice command issued: /stand_cmd=True")
 
     def _read_mono(self) -> np.ndarray | None:
         try:
@@ -442,17 +365,6 @@ class I2SVoiceNode:
 
         self.audio_messages += 1
         self.audio_bytes += len(data)
-        if self.capture_stats:
-            rospy.loginfo_throttle(
-                5.0,
-                "Capture alive: messages=%d bytes=%d frames=%d selected_channel=%d peak=%.6f rms=%.6f",
-                self.audio_messages,
-                self.audio_bytes,
-                length,
-                selected_channel,
-                float(np.max(np.abs(mono))) if mono.size else 0.0,
-                float(np.sqrt(np.mean(mono * mono))) if mono.size else 0.0,
-            )
         return mono
 
     def _capture_loop(self) -> None:
@@ -468,18 +380,11 @@ class I2SVoiceNode:
             with self._lock:
                 self.streamer.push_audio(audio_16k)
 
-            if self.resampler_stats:
-                rospy.loginfo_throttle(
-                    5.0,
-                    "Capture resampler: in_total=%d out_total=%d latest_in=%d latest_out=%d pending=%d",
-                    self.resampler.input_count,
-                    self.resampler.output_count,
-                    raw_48k.size,
-                    audio_16k.size,
-                    self.resampler.pending_samples,
-                )
-
     def on_inference_timer(self, _event=None) -> None:
+        if not self.inference_enabled:
+            rospy.loginfo_throttle(5.0, "Voice inference paused while robot state is %s", self.current_state)
+            return
+
         with self._lock:
             if not self.streamer.ready:
                 return
@@ -516,11 +421,9 @@ class I2SVoiceNode:
 
         if score < self.spotter.threshold:
             return
-        self.publisher.publish(True)
         rospy.loginfo("Detected: %s (%.3f)", label, score)
-        self._save_detected_chunk(audio, label, score)
-        if label == self.launch_target_label:
-            self._launch_everything()
+        if label == self.target_label:
+            self._publish_stand_command()
 
     # FIX 3 (cont.): join the capture thread before closing the PCM handle
     # so the thread cannot call pcm.read() on a handle we just closed.
@@ -528,16 +431,6 @@ class I2SVoiceNode:
         self._stop_event.set()
         if self.capture_thread.is_alive():
             self.capture_thread.join(timeout=2.0)
-        if self.launch_parent is not None:
-            try:
-                self.launch_parent.shutdown()
-            except Exception as exc:
-                rospy.logwarn("Failed to shutdown launched processes cleanly: %s", exc)
-        if self.launch_process is not None and not self.shutdown_after_launch:
-            try:
-                self.launch_process.terminate()
-            except OSError as exc:
-                rospy.logwarn("Failed to terminate launched roslaunch process cleanly: %s", exc)
         self._close_pcm_safe()
 
 

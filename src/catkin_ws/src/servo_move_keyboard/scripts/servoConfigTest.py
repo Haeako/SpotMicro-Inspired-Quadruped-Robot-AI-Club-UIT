@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python3
 
 """
 Class for testing control of 12 servos. It assumes ros-12cpwmboard has been

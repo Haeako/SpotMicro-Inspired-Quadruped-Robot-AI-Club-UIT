@@ -185,21 +185,27 @@ class KeywordSpotter:
         label = self.labels[1] if score >= self.threshold else self.labels[0]
         return {"label": label, "score": score}
 
+
 SAMPLE_FORMATS = {
     "S16_LE": (alsaaudio.PCM_FORMAT_S16_LE, 2, np.dtype("<i2"), 32768.0),
     "S32_LE": (alsaaudio.PCM_FORMAT_S32_LE, 4, np.dtype("<i4"), 2147483648.0),
 }
 
+# hw:1,0 only accepts period_size=128; anything larger puts the
+# device into a bad state ("File descriptor in bad state").
+MAX_SAFE_PERIOD = 128
+
 
 class I2SVoiceNode:
     def __init__(self) -> None:
         package_root = Path(rospkg.RosPack().get_path("spot_keyword_spotting"))
-        default_model = package_root / "keyword_spotting" / "weights" / "checkpoint.tflite"
+        default_model = package_root / "keyword_spotting" / "weights" / "model_int8.tflite"
 
         self.device = _get_private_param(("device", "i2s/device"), "hw:1,0")
         self.input_sample_rate = int(_get_private_param(("input_sample_rate", "i2s/sample_rate", "ros/input_sample_rate"), 48000))
         self.channels = int(_get_private_param(("channels", "i2s/channels", "ros/audio_channels"), 2))
-        self.period_size = int(_get_private_param(("period_size", "i2s/period_size"), 512))
+        # FIX 1: default period_size=128 (hardware cap for this I2S device).
+        self.period_size = int(_get_private_param(("period_size", "i2s/period_size"), 128))
         self.sample_format = str(_get_private_param(("sample_format", "i2s/sample_format"), "S32_LE")).upper()
         self.channel_index = int(_get_private_param(("channel_index", "i2s/channel_index", "ros/audio_channel_index"), 0))
         self.audio_gain = float(_get_private_param(("audio_gain", "ros/audio_gain"), 1.0))
@@ -209,7 +215,7 @@ class I2SVoiceNode:
         self.inference_rate = float(_get_private_param(("inference_rate", "model/inference_rate"), 2.0))
         self.threshold = float(_get_private_param(("confidence", "model/confidence"), 0.95))
         self.labels = tuple(_get_private_param(("labels", "model/labels"), DEFAULT_LABELS))
-        self.num_threads = int(_get_private_param(("num_threads", "model/num_threads"), 1))        
+        self.num_threads = int(_get_private_param(("num_threads", "model/num_threads"), 1))
         self.launch_on_detect = bool(_get_private_param(("launch_on_detect", "launch/enabled"), True))
         self.launch_once = bool(_get_private_param(("launch_once", "launch/once"), True))
         self.launch_cooldown = float(_get_private_param(("launch_cooldown", "launch/cooldown"), 10.0))
@@ -222,6 +228,15 @@ class I2SVoiceNode:
             package_root,
             _get_private_param(("detected_chunk_dir", "debug/detected_chunk_dir"), "detected_chunks"),
         )
+
+        # FIX 1 (cont.): clamp period_size so a misconfigured param cannot
+        # put the device into a bad state.
+        if self.period_size > MAX_SAFE_PERIOD:
+            rospy.logwarn(
+                "period_size=%d exceeds hardware cap %d; clamping.",
+                self.period_size, MAX_SAFE_PERIOD,
+            )
+            self.period_size = MAX_SAFE_PERIOD
 
         if self.sample_format not in SAMPLE_FORMATS:
             supported = ", ".join(sorted(SAMPLE_FORMATS))
@@ -296,20 +311,34 @@ class I2SVoiceNode:
             self.launch_file,
         )
 
+    # FIX 2: PCM_NONBLOCK — at period_size=128 (2.67 ms) the capture thread
+    # must service reads extremely fast.  Blocking mode stalls on any hiccup
+    # and immediately causes an overrun.  Non-blocking returns length=0 when
+    # no data is ready, and we simply sleep 1 ms and retry.
     def _open_pcm(self) -> None:
-        self.pcm = alsaaudio.PCM(alsaaudio.PCM_CAPTURE, alsaaudio.PCM_NORMAL, device=self.device)
+        self.pcm = alsaaudio.PCM(
+            alsaaudio.PCM_CAPTURE,
+            alsaaudio.PCM_NONBLOCK,
+            device=self.device,
+        )
         self.pcm.setchannels(self.channels)
         self.pcm.setrate(self.input_sample_rate)
         self.pcm.setformat(self.alsa_format)
         self.pcm.setperiodsize(self.period_size)
 
-    def _recover_pcm(self) -> None:
-        try:
-            if self.pcm is not None:
-                self.pcm.close()
-        except (AttributeError, alsaaudio.ALSAAudioError):
-            pass
+    # FIX 3: nullify self.pcm before closing so that a concurrent shutdown()
+    # call cannot double-close the same handle (which caused the
+    # "Assertion `pcm' failed" crash).
+    def _close_pcm_safe(self) -> None:
+        pcm, self.pcm = self.pcm, None   # atomic swap in CPython
+        if pcm is not None:
+            try:
+                pcm.close()
+            except (AttributeError, alsaaudio.ALSAAudioError):
+                pass
 
+    def _recover_pcm(self) -> None:
+        self._close_pcm_safe()
         self._open_pcm()
 
     def _write_wav(self, path: Path, audio: np.ndarray, sample_rate: int) -> None:
@@ -374,17 +403,22 @@ class I2SVoiceNode:
                 rospy.logwarn_throttle(2.0, "Failed to recover ALSA capture stream: %s", recover_exc)
             return None
 
-        if length <= 0:
+        if length == 0:
+            # FIX 2 (cont.): PCM_NONBLOCK returns 0 when the hardware buffer
+            # has no period ready yet.  Sleep briefly to avoid a busy-loop.
+            time.sleep(0.001)
+            return None
+
+        if length < 0:
             if length == -errno.EPIPE:
                 self.alsa_overruns += 1
                 rospy.logwarn_throttle(2.0, "ALSA overrun in capture thread (count=%d); recovering", self.alsa_overruns)
-                try:
-                    self._recover_pcm()
-                except alsaaudio.ALSAAudioError as exc:
-                    rospy.logwarn_throttle(2.0, "Failed to recover ALSA capture stream: %s", exc)
-                return None
-
-            rospy.logwarn_throttle(2.0, "ALSA read returned length=%d", length)
+            else:
+                rospy.logwarn_throttle(2.0, "ALSA read returned length=%d", length)
+            try:
+                self._recover_pcm()
+            except alsaaudio.ALSAAudioError as exc:
+                rospy.logwarn_throttle(2.0, "Failed to recover ALSA capture stream: %s", exc)
             return None
 
         samples = np.frombuffer(data, dtype=self.dtype)
@@ -488,8 +522,12 @@ class I2SVoiceNode:
         if label == self.launch_target_label:
             self._launch_everything()
 
+    # FIX 3 (cont.): join the capture thread before closing the PCM handle
+    # so the thread cannot call pcm.read() on a handle we just closed.
     def shutdown(self) -> None:
         self._stop_event.set()
+        if self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=2.0)
         if self.launch_parent is not None:
             try:
                 self.launch_parent.shutdown()
@@ -500,11 +538,7 @@ class I2SVoiceNode:
                 self.launch_process.terminate()
             except OSError as exc:
                 rospy.logwarn("Failed to terminate launched roslaunch process cleanly: %s", exc)
-        try:
-            if self.pcm is not None:
-                self.pcm.close()
-        except (AttributeError, alsaaudio.ALSAAudioError):
-            pass
+        self._close_pcm_safe()
 
 
 def main() -> None:
